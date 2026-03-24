@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: mcp-orchestrator
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --log-level info
+    healthCheckPath: /health
+    envVars:
+      - key: OUTSCRAPER_API_KEY
+        sync: false
+      - key: GHL_PIT_TOKEN
+        sync: false
+      - key: GHL_LOCATION_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false

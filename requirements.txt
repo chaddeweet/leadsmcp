@@ -1,0 +1,9 @@
+fastmcp>=2.10.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
+uvicorn[standard]>=0.30.0
+starlette>=0.41.0
+# Agent deps (only needed for agent.py, not the server itself)
+langchain-openai>=0.2.0
+langchain-mcp-adapters>=0.1.0
+langgraph>=0.2.0
