@@ -1,0 +1,25 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: Features
+      labels:
+        - feature
+        - enhancement
+    - title: Fixes
+      labels:
+        - fix
+        - bug
+    - title: Billing and Auth
+      labels:
+        - billing
+        - auth
+        - ghl
+    - title: Docs and Distribution
+      labels:
+        - docs
+        - distribution
+    - title: Other Changes
+      labels:
+        - '*'

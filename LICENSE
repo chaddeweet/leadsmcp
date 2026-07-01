@@ -1,0 +1,39 @@
+LeadsMCP Proprietary Software License
+Copyright (c) 2026 Chad de Wet. All rights reserved.
+
+This repository and the software contained within it are proprietary and confidential.
+No permission is granted to copy, modify, merge, publish, distribute, sublicense,
+sell, host for third parties, or create derivative works from this software except
+under a separate written commercial agreement signed by the copyright holder.
+
+Permitted use
+- Internal evaluation by explicitly authorized recipients.
+- Production or client use only when covered by a paid commercial agreement,
+  private repository access grant, or other written authorization from the
+  copyright holder.
+
+Restrictions
+- You may not redistribute this repository or any modified version of it.
+- You may not resell, sublicense, or white-label this software unless your
+  written commercial agreement expressly allows it.
+- You may not remove copyright, attribution, license, or proprietary notices.
+- You may not expose embedded secrets, credentials, or customer configuration.
+
+Support and updates
+- Access to updates, support, and deployment assistance is governed by the
+  applicable commercial agreement and may be suspended or terminated when that
+  agreement ends.
+
+No warranty
+- This software is provided "as is" without warranties of any kind, express or
+  implied, including merchantability, fitness for a particular purpose, title,
+  and non-infringement.
+
+Limitation of liability
+- To the maximum extent permitted by law, the copyright holder will not be
+  liable for any claim, damages, or other liability arising from or related to
+  the software or its use.
+
+Contact
+- For licensing, deployment, reseller, or enterprise questions, contact the
+  copyright holder directly.

@@ -12,5 +12,43 @@ services:
         sync: false
       - key: GHL_LOCATION_ID
         sync: false
+      - key: GHL_API_VERSION
+        value: 2021-07-28
+      - key: GHL_CLIENT_ID
+        sync: false
+      - key: GHL_CLIENT_SECRET
+        sync: false
+      - key: GHL_OAUTH_REDIRECT_URI
+        sync: false
+      - key: GHL_OAUTH_INSTALL_URL
+        sync: false
+      - key: GHL_OAUTH_TOKEN_URL
+        value: https://services.leadconnectorhq.com/oauth/token
+      - key: GHL_OAUTH_USER_TYPE
+        value: Location
+      - key: GHL_OAUTH_REQUIRE_STATE
+        value: "true"
+      - key: GHL_OAUTH_STATE_TTL_SECONDS
+        value: "900"
+      - key: GHL_OAUTH_STATE_SECRET
+        sync: false
+      - key: GHL_OAUTH_SUCCESS_REDIRECT_URL
+        sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: MCP_SECRET
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_API_VERSION
+        value: 2026-02-25.clover
+      - key: STRIPE_METER_EVENT_NAME
+        value: qualified_lead_export
+      - key: STRIPE_METER_VALUE_FIELD
+        value: leads_exported
+      - key: STRIPE_METER_CUSTOMER_FIELD
+        value: stripe_customer_id
+      - key: STRIPE_METERED_PRICE_ID
         sync: false

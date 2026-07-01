@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Sales and licensing
+    url: https://mcp.chaddewet.com/contact/
+    about: Request private repo access, a demo, or commercial terms.
+  - name: Documentation and setup help
+    url: https://mcp.chaddewet.com/support/
+    about: Get support with installation, configuration, or deployment.
