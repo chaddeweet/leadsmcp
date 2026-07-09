@@ -279,6 +279,16 @@ def build_contact_page(*, base_url: str, github_url: str, install_url: str) -> s
     return _html_shell(title='Contact LeadsMCP', body=body)
 
 
+def build_privacy_page(*, base_url: str, github_url: str) -> str:
+    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Privacy Policy</span><h1>How LeadsMCP handles your data</h1><p>Last updated 2026-07-09. This policy describes the data LeadsMCP processes and why.</p><div class="card"><h3>Who we are</h3><p>LeadsMCP is a lead-generation automation tool that connects GoHighLevel/LeadConnector, Outscraper, and Stripe through the Model Context Protocol (MCP).</p></div><div class="card"><h3>Data we process</h3><p>When you install LeadsMCP through the GoHighLevel Marketplace we receive an OAuth access token, refresh token, and the company/location identifiers needed to call the GoHighLevel API on your behalf. Lead searches send your query parameters to Outscraper and return results to your workspace. Billing operations exchange a Stripe customer identifier and export counts with Stripe.</p></div><div class="card"><h3>How we use data</h3><p>Data is used solely to provide the app's functionality: authenticating to GoHighLevel, running the searches and enrichment you request, writing records back to your CRM when you ask, and metering usage for billing. We do not sell your data or use it for advertising.</p></div><div class="card"><h3>Storage &amp; retention</h3><p>OAuth install records are stored to operate the integration and are removed when you uninstall the app or on request. Search results are returned to your session and not retained for marketing. Secrets are never displayed in logs or public pages.</p></div><div class="card"><h3>Third-party services</h3><p>LeadsMCP relies on GoHighLevel/LeadConnector, Outscraper, and Stripe. Your use of their data is also governed by each provider's own privacy policy.</p></div><div class="card"><h3>Your rights &amp; contact</h3><p>You may request access to or deletion of your data, and can revoke access anytime by uninstalling the app from GoHighLevel. For privacy requests, use the <a href="{base_url}/contact/">contact page</a>.</p></div><div class="nav-links"><a class="btn" href="{base_url}/terms/">Terms of Service</a><a class="btn" href="{base_url}/support/">Support</a></div></section></div>"""
+    return _html_shell(title='LeadsMCP Privacy Policy', body=body)
+
+
+def build_terms_page(*, base_url: str, github_url: str) -> str:
+    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Terms of Service</span><h1>The terms for using LeadsMCP</h1><p>Last updated 2026-07-09. These terms govern your installation and use of LeadsMCP.</p><div class="card"><h3>Acceptance of terms</h3><p>By installing or using LeadsMCP you agree to these Terms of Service. If you do not agree, do not install or use the app.</p></div><div class="card"><h3>The service</h3><p>LeadsMCP provides lead-generation and CRM automation by connecting GoHighLevel/LeadConnector, Outscraper, and Stripe through the Model Context Protocol. Features and limits may change as the product evolves.</p></div><div class="card"><h3>Acceptable use</h3><p>You agree to use LeadsMCP in compliance with applicable laws and the terms of the connected platforms, including anti-spam and data-protection regulations. You are responsible for how you use lead data obtained through the service.</p></div><div class="card"><h3>Billing &amp; external costs</h3><p>Lead exports are billed on a usage basis via Stripe. Outscraper and LLM provider usage may incur costs. Prices and metered charges are disclosed in the app and marketplace listing. You are responsible for charges incurred under your account.</p></div><div class="card"><h3>Disclaimer &amp; liability</h3><p>LeadsMCP is provided "as is" without warranties of any kind. To the maximum extent permitted by law, we are not liable for indirect or consequential damages arising from use of the service or third-party data returned through it.</p></div><div class="card"><h3>Changes &amp; contact</h3><p>We may update these terms; continued use after changes constitutes acceptance. See our <a href="{base_url}/privacy/">Privacy Policy</a> for data handling, or reach us via the <a href="{base_url}/contact/">contact page</a>.</p></div><div class="nav-links"><a class="btn" href="{base_url}/privacy/">Privacy Policy</a><a class="btn" href="{base_url}/support/">Support</a></div></section></div>"""
+    return _html_shell(title='LeadsMCP Terms of Service', body=body)
+
+
 def build_install_success_page(*, base_url: str, github_url: str, install_url: str, webhook_url: str) -> str:
     body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Installed</span><h1>LeadsMCP is installed successfully</h1><p>Your GoHighLevel app install completed. This page confirms the connection and can relay the install code to your automation webhook when present.</p><div class="card"><p><strong>Next:</strong> connect an MCP client, verify the subaccount context, and run a first search plus CRM write test.</p></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Install Again</a><a class="btn" href="{base_url}/support/">Support</a></div></section><script>const p=new URLSearchParams(window.location.search);const code=p.get('code');const webhook={json.dumps(webhook_url)};if(code&&webhook){{fetch(webhook,{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{code}})}}).catch(()=>{{}});}}</script></div>"""
     return _html_shell(title='LeadsMCP Installed', body=body)
@@ -300,6 +310,10 @@ class MCPSecretMiddleware(BaseHTTPMiddleware):
             "/health",
             "/support",
             "/support/",
+            "/privacy",
+            "/privacy/",
+            "/terms",
+            "/terms/",
             "/contact",
             "/contact/",
             "/app-install-successfully",
@@ -2527,6 +2541,22 @@ async def contact_page(request: Request) -> HTMLResponse:
             install_url=install_url,
         )
     )
+
+
+@orchestrator.custom_route("/privacy", methods=["GET"])
+@orchestrator.custom_route("/privacy/", methods=["GET"])
+async def privacy_page(request: Request) -> HTMLResponse:
+    base_url = _public_base_url(request)
+    github_url = os.getenv("LEADSMCP_GITHUB_URL", "https://github.com/dofski/leadsmcp").strip()
+    return HTMLResponse(build_privacy_page(base_url=base_url, github_url=github_url))
+
+
+@orchestrator.custom_route("/terms", methods=["GET"])
+@orchestrator.custom_route("/terms/", methods=["GET"])
+async def terms_page(request: Request) -> HTMLResponse:
+    base_url = _public_base_url(request)
+    github_url = os.getenv("LEADSMCP_GITHUB_URL", "https://github.com/dofski/leadsmcp").strip()
+    return HTMLResponse(build_terms_page(base_url=base_url, github_url=github_url))
 
 
 @orchestrator.custom_route("/app-install-successfully", methods=["GET"])
