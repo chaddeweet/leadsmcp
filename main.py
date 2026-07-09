@@ -91,7 +91,8 @@ def _html_shell(*, title: str, body: str) -> str:
     .section-head p:last-child {{ margin-bottom:0; }}
     .footer {{ padding:30px 0 10px; color:var(--muted); font-size:.95rem; }}
     ul {{ margin:0; padding-left:20px; color:var(--muted); }}
-    @media (max-width:720px) {{ .hero,.panel {{ padding:24px; }} nav {{ flex-direction:column; align-items:flex-start; }} }}
+    .booking-frame {{ width:100%; min-height:720px; border:0; border-radius:16px; background:rgba(255,255,255,.02); display:block; }}
+    @media (max-width:720px) {{ .hero,.panel {{ padding:24px; }} nav {{ flex-direction:column; align-items:flex-start; }} .booking-frame {{ min-height:640px; }} }}
   </style>
 </head>
 <body>
@@ -270,7 +271,7 @@ def build_landing_page(*, base_url: str, install_url: str, github_url: str, cano
 
 
 def build_support_page(*, base_url: str, install_url: str, github_url: str) -> str:
-    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Support</span><h1>LeadsMCP support and deployment help</h1><p>Use this page for install questions, deployment guidance, MCP connection help, GoHighLevel auth issues, and billing-related export behavior.</p><div class="grid cols-3"><div class="card"><h3>Best first checks</h3><ul><li>Confirm <code>x-mcp-secret</code> is set</li><li>Confirm GHL token and location ID are valid</li><li>Confirm OAuth redirect URLs match exactly</li></ul></div><div class="card"><h3>Useful endpoints</h3><ul><li><code>/health</code></li><li><code>/mcp</code></li><li><code>/oauth/ghl/start</code></li><li><code>/oauth/ghl/callback</code></li></ul></div><div class="card"><h3>Escalation paths</h3><ul><li>Deployment issues</li><li>GHL install issues</li><li>Token refresh issues</li><li>CRM write verification</li></ul></div></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Open Install Flow</a><a class="btn" href="{base_url}/contact/">Contact</a></div></section></div>"""
+    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Support</span><h1>LeadsMCP support and deployment help</h1><p>Use this page for install questions, deployment guidance, MCP connection help, GoHighLevel auth issues, and billing-related export behavior.</p><div class="grid cols-3"><div class="card"><h3>Best first checks</h3><ul><li>Confirm <code>x-mcp-secret</code> is set</li><li>Confirm GHL token and location ID are valid</li><li>Confirm OAuth redirect URLs match exactly</li></ul></div><div class="card"><h3>Useful endpoints</h3><ul><li><code>/health</code></li><li><code>/mcp</code></li><li><code>/oauth/ghl/start</code></li><li><code>/oauth/ghl/callback</code></li></ul></div><div class="card"><h3>Escalation paths</h3><ul><li>Deployment issues</li><li>GHL install issues</li><li>Token refresh issues</li><li>CRM write verification</li></ul></div></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Open Install Flow</a><a class="btn" href="{base_url}/contact/">Contact</a></div></section><section class="panel stack"><span class="kicker">Book a Call</span><h1>Schedule a support or onboarding call</h1><p>Prefer to talk it through? Pick a time that works for you and we'll help with install, deployment, or CRM setup.</p><div class="card"><iframe src="https://api.leadconnectorhq.com/widget/booking/OcxgwimfpzJwk1kCTGrP" class="booking-frame" scrolling="no" id="OcxgwimfpzJwk1kCTGrP_1783630969306"></iframe></div></section><script src="https://api.leadconnectorhq.com/js/form_embed.js" type="text/javascript"></script></div>"""
     return _html_shell(title='LeadsMCP Support', body=body)
 
 
