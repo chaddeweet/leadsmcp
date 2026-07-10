@@ -221,6 +221,29 @@ customer can bill their own Outscraper account:
 
 This means other agencies can connect to the same LeadsMCP deployment safely using their own GHL credentials without sharing your default account.
 
+### GHL Tool Allowlist
+
+The GoHighLevel native MCP exposes a large tool surface (contacts, opportunities,
+conversations, calendars, payments, locations, forms, social planner, email builder,
+blogs). LeadsMCP proxies that endpoint, so without filtering every one of those tools
+is re-exported as `ghl_<group>_<action>` — far more than the lead/contact workflow
+needs. A middleware prunes the proxied `ghl_*` tools to a configurable allowlist:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GHL_ENABLED_TOOL_GROUPS` | `contacts,opportunities,conversations,locations` | GHL tool groups to expose (matched against the `<group>` segment). |
+| `GHL_ENABLED_TOOLS` | _(empty)_ | Extra individual tools to re-enable from otherwise-disabled groups. `ghl_` prefix optional; hyphens or underscores accepted. |
+| `GHL_TOOL_ALLOWLIST_DISABLED` | `false` | Set `true` to expose the full GHL surface (no filtering) for debugging. |
+
+`ghl_contacts_create-contact` and `ghl_contacts_upsert-contact` are always enabled so
+CRM writes cannot be filtered out by a mis-configured group list. Use the hyphenated
+canonical names when calling; common aliases such as `ghl_create_contact` are
+automatically rewritten to `ghl_contacts_create-contact`.
+
+> **create-contact not active?** It requires a GHL token with the `contacts.write`
+> scope. Confirm the scope is granted (see `GHL_OAUTH_SCOPES`) and that a tenant token
+> or `GHL_PIT_TOKEN` is present; the tool is otherwise not returned by the GHL endpoint.
+
 ### Durable Install Storage
 
 For production multi-tenant installs, set `LEADSMCP_INSTALLS_DATABASE_URL` to a Postgres connection string.

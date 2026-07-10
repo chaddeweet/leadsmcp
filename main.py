@@ -47,6 +47,7 @@ from servers import outscraper_server as outscraper_tools
 from servers.outscraper_server import mcp as outscraper_mcp
 from servers.stripe_server import mcp as stripe_mcp
 from support_pages import build_marketplace_search_page
+from ghl_tools import GHLToolAllowlistMiddleware
 
 
 def _html_shell(*, title: str, body: str) -> str:
@@ -2201,8 +2202,14 @@ OUTSCRAPER tools (namespace: outscraper_):
   - outscraper_get_request_results    → Poll a pending async Outscraper request
 
 GHL tools (namespace: ghl_):
-  - Tool names are proxied dynamically from the connected GHL MCP endpoint.
+  - Tool names are proxied dynamically from the connected GHL MCP endpoint and
+    pruned to the lead/contact workflow allowlist (contacts, opportunities,
+    conversations, locations by default).
   - Discover available names with list_tools and then call the matching ghl_* tool.
+  - Canonical CRM write tools: ghl_contacts_create-contact and
+    ghl_contacts_upsert-contact (these are always enabled). Use the hyphenated
+    canonical names; common aliases are accepted but the canonical name is preferred.
+  - create-contact requires a token with the contacts.write scope.
   - GHL tools use per-request tenant credentials when provided.
 
 Stripe tools (namespace: stripe_):
@@ -2269,6 +2276,11 @@ ghl_backend = Client(ghl_transport)
 
 ghl_proxy = create_proxy(ghl_backend, name="GHL Proxy")
 orchestrator.mount(ghl_proxy, namespace="ghl")
+
+# Prune the proxied GHL surface down to the lead/contact workflow allowlist and
+# canonicalise well-known create-contact aliases. Configurable via GHL_ENABLED_TOOL_GROUPS
+# / GHL_ENABLED_TOOLS / GHL_TOOL_ALLOWLIST_DISABLED (see ghl_tools.py).
+orchestrator.add_middleware(GHLToolAllowlistMiddleware())
 
 # ── OAuth routes (GoHighLevel Marketplace install flow) ──────────────────────
 @orchestrator.custom_route("/oauth/ghl/start", methods=["GET"])
