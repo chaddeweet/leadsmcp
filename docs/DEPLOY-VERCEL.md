@@ -16,7 +16,9 @@ Use Vercel when you want:
 
 ### 2. Configure environment variables
 At minimum set:
-- `OUTSCRAPER_API_KEY`
+- `OUTSCRAPER_API_KEY` — optional fallback only. Customers normally send their own
+  key per request via the `x-api-key` MCP client header (which takes precedence).
+  Set this only for single-tenant deployments that want a shared default key.
 - `MCP_SECRET`
 - `LEADSMCP_INSTALLS_DATABASE_URL`
 - `GHL_INSTALL_ENCRYPTION_SECRET`
