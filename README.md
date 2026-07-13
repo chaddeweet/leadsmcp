@@ -90,6 +90,8 @@ railway variables set CORS_ALLOWED_ORIGINS=https://your-app.example.com
 railway variables set GHL_PIT_TOKEN=pit-xxxx
 railway variables set GHL_LOCATION_ID=xxxx
 railway variables set GHL_API_VERSION=2021-07-28
+railway variables set GHL_MCP_URL=https://services.leadconnectorhq.com/mcp/anthropic/v2
+railway variables set GHL_V2_TOOL_ALLOWLIST_ENABLED=false
 
 # GHL Marketplace OAuth (required for multi-agency installs)
 railway variables set GHL_CLIENT_ID=your_client_id
@@ -156,7 +158,6 @@ Add to your MCP config:
       "transport": "streamable_http",
       "headers": {
         "x-mcp-secret": "your_mcp_secret",
-        "x-api-key": "your_outscraper_api_key",
         "x-ghl-token": "pit_or_oauth_access_token",
         "x-ghl-location-id": "location_or_subaccount_id",
         "x-ghl-version": "2021-07-28"
@@ -174,7 +175,6 @@ Official GHL MCP header format is also supported directly:
       "url": "https://your-app.example.com/mcp",
       "headers": {
         "x-mcp-secret": "your_mcp_secret",
-        "x-api-key": "your_outscraper_api_key",
         "Authorization": "Bearer <ghl_token>",
         "locationId": "<subaccount_id>",
         "version": "2021-07-28"
@@ -198,47 +198,37 @@ The server now supports multi-tenant GHL routing per request:
 - `x-tenant-id` (optional): explicit tenant key used to resolve managed install records
 - `Authorization` + `locationId` + `version`: official GHL MCP header shape (also accepted)
 - `x-mcp-secret`: required server auth header when `MCP_SECRET` is set
-- `x-api-key`: per-request Outscraper API key used by all `outscraper_*` tools
 
 Behavior:
 
 1. If tenant headers are present, `ghl_*` tools use that tenant context.
 2. If `GHL_AUTO_REFRESH_MANAGED_TOKENS=true`, leadsmcp can resolve tenant credentials from install records and auto-refresh expired access tokens using the stored encrypted refresh token.
 3. If no tenant context resolves, server falls back to `GHL_PIT_TOKEN` + `GHL_LOCATION_ID`.
-4. `outscraper_*` tools resolve the Outscraper key per request (see below). Stripe remains a shared platform integration from server env vars.
-
-### Per-Customer Outscraper Credentials
-
-`outscraper_*` tools resolve the Outscraper API key **per request** so each
-customer can bill their own Outscraper account:
-
-- Send your Outscraper key as the `x-api-key` header from your MCP client.
-- The header takes precedence over any server-side value.
-- If `x-api-key` is absent, the server falls back to the `OUTSCRAPER_API_KEY`
-  environment variable (single-tenant / compatibility mode).
-- If neither is present, Outscraper tools return a clear error asking for the
-  key — the key value is never logged or persisted.
+4. Stripe/outscraper remain shared platform integrations from server env vars.
 
 This means other agencies can connect to the same LeadsMCP deployment safely using their own GHL credentials without sharing your default account.
 
-### GHL Tool Allowlist
+### HighLevel MCP v2 operation catalog
 
-The GoHighLevel native MCP exposes a large tool surface (contacts, opportunities,
-conversations, calendars, payments, locations, forms, social planner, email builder,
-blogs). LeadsMCP proxies that endpoint, so without filtering every one of those tools
-is re-exported as `ghl_<group>_<action>` — far more than the lead/contact workflow
-needs. A middleware prunes the proxied `ghl_*` tools to a configurable allowlist:
+LeadsMCP now proxies HighLevel v2 at `/mcp/anthropic/v2`. The upstream server exposes
+five compact tools under the `ghl_` namespace: `ghl_search`, `ghl_fetch`,
+`ghl_search_operations`, `ghl_describe_operation`, and `ghl_execute_operation`.
+Together they provide live discovery and execution of every operation allowed by the
+connected location OAuth token or PIT, including contacts, conversations, opportunities,
+calendars, payments, products, invoices, social planner, blogs, email, forms, and surveys.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GHL_ENABLED_TOOL_GROUPS` | `contacts,opportunities,conversations,locations` | GHL tool groups to expose (matched against the `<group>` segment). |
-| `GHL_ENABLED_TOOLS` | _(empty)_ | Extra individual tools to re-enable from otherwise-disabled groups. `ghl_` prefix optional; hyphens or underscores accepted. |
-| `GHL_TOOL_ALLOWLIST_DISABLED` | `false` | Set `true` to expose the full GHL surface (no filtering) for debugging. |
+| `GHL_MCP_URL` | `https://services.leadconnectorhq.com/mcp/anthropic/v2` | Override the upstream HighLevel v2 MCP endpoint. |
+| `GHL_V2_TOOL_ALLOWLIST_ENABLED` | `false` | Enable the legacy lead/contact allowlist compatibility mode. Leave false for full v2 coverage. |
+| `GHL_ENABLED_TOOL_GROUPS` | `contacts,opportunities,conversations,locations` | Groups used only when compatibility mode is enabled. |
+| `GHL_ENABLED_TOOLS` | _(empty)_ | Extra individual tools used only in compatibility mode. |
+| `GHL_TOOL_ALLOWLIST_DISABLED` | `false` | Bypass filtering after compatibility mode has been enabled. |
 
-`ghl_contacts_create-contact` and `ghl_contacts_upsert-contact` are always enabled so
-CRM writes cannot be filtered out by a mis-configured group list. Use the hyphenated
-canonical names when calling; common aliases such as `ghl_create_contact` are
-automatically rewritten to `ghl_contacts_create-contact`.
+Coverage is scope-aware: `ghl_search_operations` only returns operations granted to the
+current location connection. Use `ghl_describe_operation` before calling
+`ghl_execute_operation`, and request explicit user confirmation before destructive,
+financial, messaging, or other irreversible actions.
 
 > **create-contact not active?** It requires a GHL token with the `contacts.write`
 > scope. Confirm the scope is granted (see `GHL_OAUTH_SCOPES`) and that a tenant token

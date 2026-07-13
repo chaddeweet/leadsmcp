@@ -14,9 +14,7 @@ Use this checklist before handing LeadsMCP to a customer.
 - install docs shared
 
 ## Customer-Owned Credentials
-- Outscraper API key (sent per request as the `x-api-key` MCP client header; the
-  `OUTSCRAPER_API_KEY` env var is an optional single-tenant fallback and the
-  header takes precedence)
+- Outscraper API key
 - GHL app credentials or PIT token
 - GHL redirect URLs confirmed
 - Stripe credentials if export billing is enabled
@@ -30,10 +28,9 @@ Use this checklist before handing LeadsMCP to a customer.
 
 ## Functional Verification
 - MCP connection succeeds
-- `x-api-key` header set (or `OUTSCRAPER_API_KEY` fallback configured)
 - GHL tools list successfully
 - search tools list successfully
-- one search run succeeds (confirms the Outscraper key resolves)
+- one search run succeeds
 - one CRM write succeeds in correct location
 - token refresh storage verified
 
