@@ -30,39 +30,13 @@ import asyncio
 import httpx
 from typing import Optional
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_http_headers
 
 mcp = FastMCP(name="Outscraper")
 
 BASE_URL = "https://api.outscraper.cloud"
 
-
-def _resolve_api_key() -> str:
-    """Resolve the Outscraper API key for the current request.
-
-    Precedence:
-      1) inbound ``x-api-key`` HTTP header (per-request, multi-tenant)
-      2) ``OUTSCRAPER_API_KEY`` environment variable (optional fallback)
-
-    The header always wins when present. Raises a clear error if neither
-    source yields a key. The key value is never logged or persisted.
-    """
-    header_key = get_http_headers(include={"x-api-key"}).get("x-api-key")
-    if header_key and header_key.strip():
-        return header_key.strip()
-
-    env_key = os.getenv("OUTSCRAPER_API_KEY", "")
-    if env_key and env_key.strip():
-        return env_key.strip()
-
-    raise RuntimeError(
-        "Missing Outscraper API key. Send it as the 'x-api-key' request header "
-        "from your MCP client, or set the OUTSCRAPER_API_KEY environment variable."
-    )
-
-
 def _headers() -> dict:
-    return {"X-API-KEY": _resolve_api_key()}
+    return {"X-API-KEY": os.getenv("OUTSCRAPER_API_KEY", "")}
 
 
 def _with_outscraper_defaults(params: dict) -> dict:

@@ -156,7 +156,6 @@ Add to your MCP config:
       "transport": "streamable_http",
       "headers": {
         "x-mcp-secret": "your_mcp_secret",
-        "x-api-key": "your_outscraper_api_key",
         "x-ghl-token": "pit_or_oauth_access_token",
         "x-ghl-location-id": "location_or_subaccount_id",
         "x-ghl-version": "2021-07-28"
@@ -174,7 +173,6 @@ Official GHL MCP header format is also supported directly:
       "url": "https://your-app.example.com/mcp",
       "headers": {
         "x-mcp-secret": "your_mcp_secret",
-        "x-api-key": "your_outscraper_api_key",
         "Authorization": "Bearer <ghl_token>",
         "locationId": "<subaccount_id>",
         "version": "2021-07-28"
@@ -198,26 +196,13 @@ The server now supports multi-tenant GHL routing per request:
 - `x-tenant-id` (optional): explicit tenant key used to resolve managed install records
 - `Authorization` + `locationId` + `version`: official GHL MCP header shape (also accepted)
 - `x-mcp-secret`: required server auth header when `MCP_SECRET` is set
-- `x-api-key`: per-request Outscraper API key used by all `outscraper_*` tools
 
 Behavior:
 
 1. If tenant headers are present, `ghl_*` tools use that tenant context.
 2. If `GHL_AUTO_REFRESH_MANAGED_TOKENS=true`, leadsmcp can resolve tenant credentials from install records and auto-refresh expired access tokens using the stored encrypted refresh token.
 3. If no tenant context resolves, server falls back to `GHL_PIT_TOKEN` + `GHL_LOCATION_ID`.
-4. `outscraper_*` tools resolve the Outscraper key per request (see below). Stripe remains a shared platform integration from server env vars.
-
-### Per-Customer Outscraper Credentials
-
-`outscraper_*` tools resolve the Outscraper API key **per request** so each
-customer can bill their own Outscraper account:
-
-- Send your Outscraper key as the `x-api-key` header from your MCP client.
-- The header takes precedence over any server-side value.
-- If `x-api-key` is absent, the server falls back to the `OUTSCRAPER_API_KEY`
-  environment variable (single-tenant / compatibility mode).
-- If neither is present, Outscraper tools return a clear error asking for the
-  key — the key value is never logged or persisted.
+4. Stripe/outscraper remain shared platform integrations from server env vars.
 
 This means other agencies can connect to the same LeadsMCP deployment safely using their own GHL credentials without sharing your default account.
 

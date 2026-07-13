@@ -92,8 +92,7 @@ def _html_shell(*, title: str, body: str) -> str:
     .section-head p:last-child {{ margin-bottom:0; }}
     .footer {{ padding:30px 0 10px; color:var(--muted); font-size:.95rem; }}
     ul {{ margin:0; padding-left:20px; color:var(--muted); }}
-    .booking-frame {{ width:100%; min-height:720px; border:0; border-radius:16px; background:rgba(255,255,255,.02); display:block; }}
-    @media (max-width:720px) {{ .hero,.panel {{ padding:24px; }} nav {{ flex-direction:column; align-items:flex-start; }} .booking-frame {{ min-height:640px; }} }}
+    @media (max-width:720px) {{ .hero,.panel {{ padding:24px; }} nav {{ flex-direction:column; align-items:flex-start; }} }}
   </style>
 </head>
 <body>
@@ -272,23 +271,13 @@ def build_landing_page(*, base_url: str, install_url: str, github_url: str, cano
 
 
 def build_support_page(*, base_url: str, install_url: str, github_url: str) -> str:
-    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Support</span><h1>LeadsMCP support and deployment help</h1><p>Use this page for install questions, deployment guidance, MCP connection help, GoHighLevel auth issues, and billing-related export behavior.</p><div class="grid cols-3"><div class="card"><h3>Best first checks</h3><ul><li>Confirm <code>x-mcp-secret</code> is set</li><li>Confirm GHL token and location ID are valid</li><li>Confirm OAuth redirect URLs match exactly</li></ul></div><div class="card"><h3>Useful endpoints</h3><ul><li><code>/health</code></li><li><code>/mcp</code></li><li><code>/oauth/ghl/start</code></li><li><code>/oauth/ghl/callback</code></li></ul></div><div class="card"><h3>Escalation paths</h3><ul><li>Deployment issues</li><li>GHL install issues</li><li>Token refresh issues</li><li>CRM write verification</li></ul></div></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Open Install Flow</a><a class="btn" href="{base_url}/contact/">Contact</a></div></section><section class="panel stack"><span class="kicker">Book a Call</span><h1>Schedule a support or onboarding call</h1><p>Prefer to talk it through? Pick a time that works for you and we'll help with install, deployment, or CRM setup.</p><div class="card"><iframe src="https://api.leadconnectorhq.com/widget/booking/OcxgwimfpzJwk1kCTGrP" class="booking-frame" scrolling="no" id="OcxgwimfpzJwk1kCTGrP_1783630969306"></iframe></div></section><script src="https://api.leadconnectorhq.com/js/form_embed.js" type="text/javascript"></script></div>"""
+    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Support</span><h1>LeadsMCP support and deployment help</h1><p>Use this page for install questions, deployment guidance, MCP connection help, GoHighLevel auth issues, and billing-related export behavior.</p><div class="grid cols-3"><div class="card"><h3>Best first checks</h3><ul><li>Confirm <code>x-mcp-secret</code> is set</li><li>Confirm GHL token and location ID are valid</li><li>Confirm OAuth redirect URLs match exactly</li></ul></div><div class="card"><h3>Useful endpoints</h3><ul><li><code>/health</code></li><li><code>/mcp</code></li><li><code>/oauth/ghl/start</code></li><li><code>/oauth/ghl/callback</code></li></ul></div><div class="card"><h3>Escalation paths</h3><ul><li>Deployment issues</li><li>GHL install issues</li><li>Token refresh issues</li><li>CRM write verification</li></ul></div></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Open Install Flow</a><a class="btn" href="{base_url}/contact/">Contact</a></div></section></div>"""
     return _html_shell(title='LeadsMCP Support', body=body)
 
 
 def build_contact_page(*, base_url: str, github_url: str, install_url: str) -> str:
     body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Contact</span><h1>Talk to us about LeadsMCP</h1><p>Use LeadsMCP as a private commercial server for live lead search, MCP-connected workflows, and GoHighLevel handoff. Reach out for demos, licensing, managed setup, or enterprise deployment help.</p><div class="grid cols-3"><div class="card"><h3>Commercial</h3><p>Private repo access, managed setup, and customer onboarding.</p></div><div class="card"><h3>Technical</h3><p>MCP integration, CRM sync, token refresh, and deployment support.</p></div><div class="card"><h3>Next step</h3><p>Start the install flow or use the GitHub repo to review the product surface.</p></div></div><div class="nav-links"><a class="btn primary" href="{install_url or (base_url + '/oauth/ghl/start')}">Install LeadsMCP</a><a class="btn" href="{github_url}">GitHub</a></div></section></div>"""
     return _html_shell(title='Contact LeadsMCP', body=body)
-
-
-def build_privacy_page(*, base_url: str, github_url: str) -> str:
-    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Privacy Policy</span><h1>How LeadsMCP handles your data</h1><p>Last updated 2026-07-09. This policy describes the data LeadsMCP processes and why.</p><div class="card"><h3>Who we are</h3><p>LeadsMCP is a lead-generation automation tool that connects GoHighLevel/LeadConnector, Outscraper, and Stripe through the Model Context Protocol (MCP).</p></div><div class="card"><h3>Data we process</h3><p>When you install LeadsMCP through the GoHighLevel Marketplace we receive an OAuth access token, refresh token, and the company/location identifiers needed to call the GoHighLevel API on your behalf. Lead searches send your query parameters to Outscraper and return results to your workspace. Billing operations exchange a Stripe customer identifier and export counts with Stripe.</p></div><div class="card"><h3>How we use data</h3><p>Data is used solely to provide the app's functionality: authenticating to GoHighLevel, running the searches and enrichment you request, writing records back to your CRM when you ask, and metering usage for billing. We do not sell your data or use it for advertising.</p></div><div class="card"><h3>Storage &amp; retention</h3><p>OAuth install records are stored to operate the integration and are removed when you uninstall the app or on request. Search results are returned to your session and not retained for marketing. Secrets are never displayed in logs or public pages.</p></div><div class="card"><h3>Third-party services</h3><p>LeadsMCP relies on GoHighLevel/LeadConnector, Outscraper, and Stripe. Your use of their data is also governed by each provider's own privacy policy.</p></div><div class="card"><h3>Your rights &amp; contact</h3><p>You may request access to or deletion of your data, and can revoke access anytime by uninstalling the app from GoHighLevel. For privacy requests, use the <a href="{base_url}/contact/">contact page</a>.</p></div><div class="nav-links"><a class="btn" href="{base_url}/terms/">Terms of Service</a><a class="btn" href="{base_url}/support/">Support</a></div></section></div>"""
-    return _html_shell(title='LeadsMCP Privacy Policy', body=body)
-
-
-def build_terms_page(*, base_url: str, github_url: str) -> str:
-    body = f"""<div class="wrap stack">{_page_nav(base_url, github_url)}<section class="panel stack"><span class="kicker">Terms of Service</span><h1>The terms for using LeadsMCP</h1><p>Last updated 2026-07-09. These terms govern your installation and use of LeadsMCP.</p><div class="card"><h3>Acceptance of terms</h3><p>By installing or using LeadsMCP you agree to these Terms of Service. If you do not agree, do not install or use the app.</p></div><div class="card"><h3>The service</h3><p>LeadsMCP provides lead-generation and CRM automation by connecting GoHighLevel/LeadConnector, Outscraper, and Stripe through the Model Context Protocol. Features and limits may change as the product evolves.</p></div><div class="card"><h3>Acceptable use</h3><p>You agree to use LeadsMCP in compliance with applicable laws and the terms of the connected platforms, including anti-spam and data-protection regulations. You are responsible for how you use lead data obtained through the service.</p></div><div class="card"><h3>Billing &amp; external costs</h3><p>Lead exports are billed on a usage basis via Stripe. Outscraper and LLM provider usage may incur costs. Prices and metered charges are disclosed in the app and marketplace listing. You are responsible for charges incurred under your account.</p></div><div class="card"><h3>Disclaimer &amp; liability</h3><p>LeadsMCP is provided "as is" without warranties of any kind. To the maximum extent permitted by law, we are not liable for indirect or consequential damages arising from use of the service or third-party data returned through it.</p></div><div class="card"><h3>Changes &amp; contact</h3><p>We may update these terms; continued use after changes constitutes acceptance. See our <a href="{base_url}/privacy/">Privacy Policy</a> for data handling, or reach us via the <a href="{base_url}/contact/">contact page</a>.</p></div><div class="nav-links"><a class="btn" href="{base_url}/privacy/">Privacy Policy</a><a class="btn" href="{base_url}/support/">Support</a></div></section></div>"""
-    return _html_shell(title='LeadsMCP Terms of Service', body=body)
 
 
 def build_install_success_page(*, base_url: str, github_url: str, install_url: str, webhook_url: str) -> str:
@@ -312,19 +301,18 @@ class MCPSecretMiddleware(BaseHTTPMiddleware):
             "/health",
             "/support",
             "/support/",
-            "/privacy",
-            "/privacy/",
-            "/terms",
-            "/terms/",
             "/contact",
             "/contact/",
             "/app-install-successfully",
             "/app-install-successfully/",
             "/app/lead-search",
             "/app/lead-search/",
+            "/app/onboarding",
+            "/app/onboarding/",
             "/api/marketplace/user-context",
             "/api/marketplace/lead-search",
             "/api/marketplace/llm-chat",
+            "/api/onboarding-chat",
             "/oauth/ghl/start",
             "/oauth/ghl/callback",
             "/leadsmcp/install",
@@ -2556,22 +2544,6 @@ async def contact_page(request: Request) -> HTMLResponse:
     )
 
 
-@orchestrator.custom_route("/privacy", methods=["GET"])
-@orchestrator.custom_route("/privacy/", methods=["GET"])
-async def privacy_page(request: Request) -> HTMLResponse:
-    base_url = _public_base_url(request)
-    github_url = os.getenv("LEADSMCP_GITHUB_URL", "https://github.com/dofski/leadsmcp").strip()
-    return HTMLResponse(build_privacy_page(base_url=base_url, github_url=github_url))
-
-
-@orchestrator.custom_route("/terms", methods=["GET"])
-@orchestrator.custom_route("/terms/", methods=["GET"])
-async def terms_page(request: Request) -> HTMLResponse:
-    base_url = _public_base_url(request)
-    github_url = os.getenv("LEADSMCP_GITHUB_URL", "https://github.com/dofski/leadsmcp").strip()
-    return HTMLResponse(build_terms_page(base_url=base_url, github_url=github_url))
-
-
 @orchestrator.custom_route("/app-install-successfully", methods=["GET"])
 @orchestrator.custom_route("/app-install-successfully/", methods=["GET"])
 async def install_success_page(request: Request) -> HTMLResponse:
@@ -2587,6 +2559,13 @@ async def install_success_page(request: Request) -> HTMLResponse:
             webhook_url=webhook_url,
         )
     )
+
+
+@orchestrator.custom_route("/app/onboarding", methods=["GET"])
+@orchestrator.custom_route("/app/onboarding/", methods=["GET"])
+async def onboarding_chat_page(request: Request) -> HTMLResponse:
+    html_path = Path(__file__).parent / "pages" / "onboarding-chat.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
 @orchestrator.custom_route("/app/lead-search", methods=["GET"])
@@ -2804,6 +2783,151 @@ Marketplace session:
             "model": llm_config["model"],
             "provider": llm_config["provider"],
             "context": context_summary,
+        }
+    )
+
+
+@orchestrator.custom_route("/api/onboarding-chat", methods=["POST"])
+async def onboarding_chat_api(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    raw_messages = body.get("messages") or []
+    location_id = str(body.get("location_id") or "").strip()
+    location_name = str(body.get("location_name") or "").strip() or "this location"
+    user_name = str(body.get("user_name") or "").strip() or "there"
+    provided_mcp_url = str(body.get("mcp_url") or "").strip()
+
+    if not provided_mcp_url:
+        return JSONResponse(
+            {"ok": False, "error": "missing_mcp_url", "message": "Request JSON must include mcp_url."},
+            status_code=400,
+        )
+
+    try:
+        llm_config = _marketplace_llm_config()
+    except ValueError as exc:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "missing_llm_api_key",
+                "message": str(exc),
+                "provider": _marketplace_llm_provider(),
+            },
+            status_code=503,
+        )
+
+    try:
+        messages = _coerce_marketplace_chat_messages(raw_messages)
+    except ValueError as exc:
+        return JSONResponse(
+            {"ok": False, "error": "invalid_request", "message": str(exc)},
+            status_code=400,
+        )
+
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+        from langgraph.prebuilt import create_react_agent
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "error": "llm_dependencies_unavailable", "message": str(exc)},
+            status_code=500,
+        )
+
+    normalized_mcp_url = provided_mcp_url.rstrip("/")
+    mcp_url = normalized_mcp_url if normalized_mcp_url.endswith("/mcp") else f"{normalized_mcp_url}/mcp"
+
+    system_prompt = f"""
+You are the LeadsMCP onboarding assistant embedded inside a GoHighLevel custom page.
+
+Goals:
+- Help the user onboard after installation.
+- Speak in the context of their exact HighLevel location/sub-account.
+- Explain how to connect AI clients like Claude Desktop, Cursor, or ChatGPT-compatible tooling.
+- Recommend the fastest path to value using LeadsMCP tools.
+- Troubleshoot setup and activation issues clearly.
+
+Rules:
+- You are connected to the user's LeadsMCP MCP server.
+- Prefer practical next steps and concise guidance.
+- If the user asks you to perform an action and a tool exists, use it.
+- If you change or create records, briefly summarize what you changed.
+- Keep responses formatted in clear markdown.
+
+Session context:
+- location_id: {location_id or 'unknown'}
+- location_name: {location_name}
+- current_user: {user_name}
+- mcp_server_url: {normalized_mcp_url}
+""".strip()
+
+    try:
+        client = MultiServerMCPClient(
+            {
+                "leadsmcp": {
+                    "url": mcp_url,
+                    "transport": "streamable_http",
+                    "headers": {"X-GHL-Location-ID": location_id} if location_id else {},
+                }
+            }
+        )
+        tools = await client.get_tools()
+        onboarding_tools = [
+            tool for tool in tools
+            if getattr(tool, "name", "").startswith("outscraper_")
+            or getattr(tool, "name", "").startswith("ghl_")
+        ]
+
+        llm_kwargs: dict[str, Any] = {
+            "model": llm_config["model"],
+            "api_key": llm_config["api_key"],
+            "temperature": 1e-8,
+        }
+        if llm_config.get("base_url"):
+            llm_kwargs["base_url"] = llm_config["base_url"]
+
+        llm = ChatOpenAI(**llm_kwargs)
+        agent = create_react_agent(llm, onboarding_tools, prompt=system_prompt)
+        result = await agent.ainvoke({"messages": messages})
+    except Exception as exc:
+        return JSONResponse(
+            {"ok": False, "error": "llm_run_failed", "message": str(exc)},
+            status_code=500,
+        )
+
+    reply = ""
+    tool_calls: list[str] = []
+    for msg in result.get("messages", []):
+        msg_type = getattr(msg, "type", "")
+        if msg_type == "ai":
+            text = _message_content_text(getattr(msg, "content", ""))
+            if text:
+                reply = text
+            for call in getattr(msg, "tool_calls", []) or []:
+                if isinstance(call, dict) and call.get("name"):
+                    tool_calls.append(str(call["name"]))
+
+    if not reply:
+        reply = "I connected to the onboarding workspace, but I did not generate a final answer. Please try rephrasing the request."
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "reply": reply,
+            "toolCalls": sorted(set(tool_calls)),
+            "model": llm_config["model"],
+            "provider": llm_config["provider"],
+            "context": {
+                "locationId": location_id,
+                "locationName": location_name,
+                "userName": user_name,
+                "mcpUrl": normalized_mcp_url,
+            },
         }
     )
 

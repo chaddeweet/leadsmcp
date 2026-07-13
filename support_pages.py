@@ -2655,28 +2655,6 @@ def build_marketplace_search_page(
       border-color: color-mix(in srgb, var(--color-primary) 28%, var(--color-border));
       background: color-mix(in srgb, var(--color-primary-dim) 72%, transparent);
     }
-    a.response-card-action {
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-    }
-    .response-card-action.is-primary {
-      border-color: transparent;
-      background: var(--color-primary);
-      color: var(--color-on-primary, #07110f);
-    }
-    .response-card-action.is-primary:hover {
-      background: color-mix(in srgb, var(--color-primary) 86%, #000);
-    }
-    .response-card-action:disabled {
-      opacity: 0.55;
-      cursor: default;
-    }
-    .lead-card-links {
-      border-top: none;
-      padding-top: 0;
-      margin-top: var(--space-3);
-    }
     .response-card-list {
       display: grid;
       gap: var(--space-2);
@@ -3920,19 +3898,12 @@ def build_marketplace_search_page(
 
       async function submitAiPrompt(event) {
         event.preventDefault();
-        if (!aiInput) return;
+        if (!state.encryptedData || !aiInput) return;
         const prompt = aiInput.value.trim();
         if (!prompt) return;
-        aiInput.value = '';
-        await runAiPrompt(prompt);
-      }
-
-      async function runAiPrompt(rawPrompt) {
-        if (!state.encryptedData) return;
-        const prompt = String(rawPrompt || '').trim();
-        if (!prompt || state.aiBusy) return;
 
         state.aiMessages.push({ role: 'user', content: prompt });
+        aiInput.value = '';
         state.aiBusy = true;
         setAiComposerEnabled(true);
         setAiStatus('Running the copilot against the LeadsMCP research tools…', aiModel ? aiModel.textContent : '');
@@ -3972,73 +3943,6 @@ def build_marketplace_search_page(
           setAiComposerEnabled(Boolean(state.encryptedData));
           renderAiThread();
         }
-      }
-
-      function leadWebsiteHref(lead) {
-        const raw = lead && (lead.website || (lead.websiteDomain ? `https://${lead.websiteDomain}` : ''));
-        if (!raw) return '';
-        return String(raw).startsWith('http') ? String(raw) : `https://${raw}`;
-      }
-
-      function renderLeadLinkButtons(lead) {
-        const buttons = [];
-        const site = leadWebsiteHref(lead);
-        if (site) {
-          buttons.push(`<a class="response-card-action" href="${escapeHtml(site)}" target="_blank" rel="noopener noreferrer">Website</a>`);
-        }
-        if (lead.email) {
-          buttons.push(`<a class="response-card-action" href="mailto:${escapeHtml(lead.email)}">Email</a>`);
-        }
-        if (lead.phone) {
-          const dial = String(lead.phone).replace(/[^0-9+]/g, '');
-          if (dial) buttons.push(`<a class="response-card-action" href="tel:${escapeHtml(dial)}">Call</a>`);
-        }
-        if (lead.sourceUrl) {
-          buttons.push(`<a class="response-card-action" href="${escapeHtml(lead.sourceUrl)}" target="_blank" rel="noopener noreferrer">Profile</a>`);
-        }
-        if (!buttons.length) return '';
-        return `<div class="response-card-actions lead-card-links">${buttons.join('')}</div>`;
-      }
-
-      function buildLeadPushPrompt(lead) {
-        const fields = {
-          name: lead.name || '',
-          companyName: lead.name || '',
-          email: lead.email || '',
-          phone: lead.phone || '',
-          website: leadWebsiteHref(lead) || lead.websiteDomain || '',
-          jobTitle: lead.category || '',
-          address: lead.address || '',
-          city: lead.city || '',
-          state: lead.state || '',
-          postalCode: lead.postalCode || '',
-          country: lead.country || '',
-          sourceUrl: lead.sourceUrl || '',
-          source: 'LeadsMCP lead search',
-        };
-        const clean = {};
-        Object.entries(fields).forEach(([key, value]) => {
-          if (value) clean[key] = value;
-        });
-        return [
-          'Create or update a contact in the currently connected GoHighLevel location using the LeadsMCP GHL tools.',
-          'Match on email or phone first to avoid duplicates: update the existing contact if one already exists, otherwise create a new one.',
-          'After writing, confirm exactly what you created or updated.',
-          '',
-          'Lead details:',
-          JSON.stringify(clean, null, 2),
-        ].join('\\n');
-      }
-
-      function pushLeadToLocation(leadId) {
-        const lead = getLeadById(leadId);
-        if (!lead) return;
-        openAiWorkspace(false);
-        if (!state.encryptedData) {
-          setAiStatus('Load the HighLevel context first, then push leads to your location.', '');
-          return;
-        }
-        void runAiPrompt(buildLeadPushPrompt(lead));
       }
 
       function renderContext(context) {
@@ -4377,9 +4281,6 @@ def build_marketplace_search_page(
         ];
         if (options.openLeadId) {
           buttons.unshift(`<button class="response-card-action" type="button" data-lead-open="${escapeHtml(options.openLeadId)}">Open Detail</button>`);
-        }
-        if (options.pushLeadId) {
-          buttons.unshift(`<button class="response-card-action is-primary" type="button" data-lead-push="${escapeHtml(options.pushLeadId)}">Push to Location</button>`);
         }
         return `<div class="response-card-actions">${buttons.join('')}</div>`;
       }
@@ -4762,8 +4663,7 @@ def build_marketplace_search_page(
                   ${lead.description ? `<p class="lead-card-snippet">${escapeHtml(lead.description)}</p>` : ''}
                 </div>
               </button>
-              ${renderLeadLinkButtons(lead)}
-              ${renderCardActions(index, { openLeadId: lead.id, pushLeadId: lead.id })}
+              ${renderCardActions(index, { openLeadId: lead.id })}
             </article>
           `;
         }).join('');
@@ -5422,13 +5322,6 @@ def build_marketplace_search_page(
           event.preventDefault();
           event.stopPropagation();
           exportResultCard(Number(exportButton.dataset.cardExport));
-          return;
-        }
-        const pushButton = event.target.closest('[data-lead-push]');
-        if (pushButton) {
-          event.preventDefault();
-          event.stopPropagation();
-          pushLeadToLocation(pushButton.dataset.leadPush);
           return;
         }
         const button = event.target.closest('[data-lead-open]');
