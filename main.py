@@ -2189,16 +2189,14 @@ OUTSCRAPER tools (namespace: outscraper_):
   - outscraper_google_search          → Research a prospect before outreach
   - outscraper_get_request_results    → Poll a pending async Outscraper request
 
-GHL tools (namespace: ghl_):
-  - Tool names are proxied dynamically from the connected GHL MCP endpoint and
-    pruned to the lead/contact workflow allowlist (contacts, opportunities,
-    conversations, locations by default).
-  - Discover available names with list_tools and then call the matching ghl_* tool.
-  - Canonical CRM write tools: ghl_contacts_create-contact and
-    ghl_contacts_upsert-contact (these are always enabled). Use the hyphenated
-    canonical names; common aliases are accepted but the canonical name is preferred.
-  - create-contact requires a token with the contacts.write scope.
-  - GHL tools use per-request tenant credentials when provided.
+GHL v2 tools (namespace: ghl_):
+  - ghl_search             → Search CRM records across the connected location
+  - ghl_fetch              → Fetch complete records by ID
+  - ghl_search_operations  → Discover any permitted HighLevel API operation by intent
+  - ghl_describe_operation → Retrieve the required schema for an operation
+  - ghl_execute_operation  → Execute a discovered operation using the described schema
+  - The v2 operation catalog covers all domains granted by the connected OAuth/PIT scopes.
+  - GHL tools use per-request tenant credentials and remain restricted to one location.
 
 Stripe tools (namespace: stripe_):
   - stripe_ensure_customer_profile               → Create/update customer before showing full lead details
@@ -2256,7 +2254,7 @@ if DEFAULT_GHL_VERSION:
     default_ghl_headers["version"] = DEFAULT_GHL_VERSION
 
 ghl_transport = GHLTenantAwareTransport(
-    url="https://services.leadconnectorhq.com/mcp/",
+    url=os.getenv("GHL_MCP_URL", "https://services.leadconnectorhq.com/mcp/anthropic/v2").strip(),
     headers=default_ghl_headers,
 )
 ghl_backend = Client(ghl_transport)
@@ -2265,10 +2263,11 @@ ghl_backend = Client(ghl_transport)
 ghl_proxy = create_proxy(ghl_backend, name="GHL Proxy")
 orchestrator.mount(ghl_proxy, namespace="ghl")
 
-# Prune the proxied GHL surface down to the lead/contact workflow allowlist and
-# canonicalise well-known create-contact aliases. Configurable via GHL_ENABLED_TOOL_GROUPS
-# / GHL_ENABLED_TOOLS / GHL_TOOL_ALLOWLIST_DISABLED (see ghl_tools.py).
-orchestrator.add_middleware(GHLToolAllowlistMiddleware())
+# HighLevel v2 exposes a compact five-tool catalog that discovers hundreds of operations.
+# Expose the complete v2 surface by default. The legacy lead/contact allowlist remains
+# available as an opt-in compatibility mode for constrained deployments.
+if os.getenv("GHL_V2_TOOL_ALLOWLIST_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+    orchestrator.add_middleware(GHLToolAllowlistMiddleware())
 
 # ── OAuth routes (GoHighLevel Marketplace install flow) ──────────────────────
 @orchestrator.custom_route("/oauth/ghl/start", methods=["GET"])
