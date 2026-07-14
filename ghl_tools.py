@@ -59,6 +59,21 @@ ALWAYS_ENABLED_TOOLS = (
     "ghl_contacts_upsert-contact",
 )
 
+# HighLevel MCP v2 exposes a compact catalog of unified tools instead of one tool per
+# operation. Their names have no "<group>_" segment that the allowlist group filter can
+# match (e.g. ``ghl_execute_operation`` parses to group "execute"), so plain group
+# filtering would silently drop the entire v2 surface — including discovery and
+# execution — the moment compatibility mode is switched on. These entrypoints gate access
+# at the *operation* level upstream (subject to the connected token's scopes), so the
+# tool-level allowlist must never hide them regardless of the configured groups.
+V2_CATALOG_TOOLS = (
+    "ghl_search",
+    "ghl_fetch",
+    "ghl_search_operations",
+    "ghl_describe_operation",
+    "ghl_execute_operation",
+)
+
 # Non-canonical names a client might guess, mapped to the canonical GHL tool name.
 # Keys are given in "loose" form (see _loose): all separators after ``ghl_`` become
 # hyphens, so ``ghl_create_contact`` and ``ghl_create-contact`` match the same entry.
@@ -140,6 +155,8 @@ def is_tool_allowed(name: str, config: dict) -> bool:
     if config["disabled"]:
         return True
     normalized = _normalize(name)
+    if normalized in V2_CATALOG_TOOLS:
+        return True
     if normalized in config["explicit"]:
         return True
     return _group_of(normalized) in config["groups"]

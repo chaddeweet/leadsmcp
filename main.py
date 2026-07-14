@@ -48,6 +48,12 @@ from servers.outscraper_server import mcp as outscraper_mcp
 from servers.stripe_server import mcp as stripe_mcp
 from support_pages import build_marketplace_search_page
 from ghl_tools import GHLToolAllowlistMiddleware
+from ghl_contact_create import (
+    ContactCreateError,
+    build_create_contact_body,
+    map_create_contact_response,
+)
+from fastmcp.exceptions import ToolError
 
 
 def _html_shell(*, title: str, body: str) -> str:
@@ -333,6 +339,50 @@ class MCPSecretMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+GHL_TENANT_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "locationid",
+        "version",
+        "x-ghl-token",
+        "x-ghl-location-id",
+        "x-ghl-version",
+    }
+)
+
+
+def build_ghl_tenant_headers(incoming_headers: dict[str, str]) -> dict[str, str]:
+    """Map inbound request headers to the upstream GHL header names.
+
+    Pure and side-effect free so the tenant-credential precedence can be unit tested
+    without a live MCP session. Precedence per field:
+      1) x-ghl-* tenant override
+      2) native GHL header (authorization / locationid / version)
+    The bearer token is normalised to ``Bearer <token>`` exactly once. Only headers that
+    resolve to a value are returned; callers merge these over the static env defaults so
+    an absent tenant header falls back to the server default.
+    """
+    tenant_headers: dict[str, str] = {}
+
+    ghl_token = incoming_headers.get("x-ghl-token") or incoming_headers.get("authorization")
+    if ghl_token:
+        normalized_token = ghl_token.strip()
+        if normalized_token and not normalized_token.lower().startswith("bearer "):
+            normalized_token = f"Bearer {normalized_token}"
+        if normalized_token:
+            tenant_headers["authorization"] = normalized_token
+
+    ghl_location = incoming_headers.get("x-ghl-location-id") or incoming_headers.get("locationid")
+    if ghl_location:
+        tenant_headers["locationid"] = ghl_location.strip()
+
+    ghl_version = incoming_headers.get("x-ghl-version") or incoming_headers.get("version")
+    if ghl_version:
+        tenant_headers["version"] = ghl_version.strip()
+
+    return tenant_headers
+
+
 class GHLTenantAwareTransport(StreamableHttpTransport):
     """
     Streamable HTTP transport that forwards tenant-specific GHL headers per request.
@@ -344,34 +394,9 @@ class GHLTenantAwareTransport(StreamableHttpTransport):
 
     @contextlib.asynccontextmanager
     async def connect_session(self, **session_kwargs) -> AsyncIterator[ClientSession]:
-        incoming_headers = get_http_headers(
-            include={
-                "authorization",
-                "locationid",
-                "version",
-                "x-ghl-token",
-                "x-ghl-location-id",
-                "x-ghl-version",
-            }
-        )
+        incoming_headers = get_http_headers(include=set(GHL_TENANT_HEADER_NAMES))
 
-        tenant_headers: dict[str, str] = {}
-
-        ghl_token = incoming_headers.get("x-ghl-token") or incoming_headers.get("authorization")
-        if ghl_token:
-            normalized_token = ghl_token.strip()
-            if normalized_token and not normalized_token.lower().startswith("bearer "):
-                normalized_token = f"Bearer {normalized_token}"
-            if normalized_token:
-                tenant_headers["authorization"] = normalized_token
-
-        ghl_location = incoming_headers.get("x-ghl-location-id") or incoming_headers.get("locationid")
-        if ghl_location:
-            tenant_headers["locationid"] = ghl_location.strip()
-
-        ghl_version = incoming_headers.get("x-ghl-version") or incoming_headers.get("version")
-        if ghl_version:
-            tenant_headers["version"] = ghl_version.strip()
+        tenant_headers = build_ghl_tenant_headers(incoming_headers)
 
         headers = self.headers | tenant_headers
 
@@ -2190,13 +2215,18 @@ OUTSCRAPER tools (namespace: outscraper_):
   - outscraper_get_request_results    → Poll a pending async Outscraper request
 
 GHL v2 tools (namespace: ghl_):
+  - ghl_contacts_create_contact → PREFERRED for creating a contact (deterministic REST POST /contacts/)
+  - ghl_contacts_upsert_contact → PREFERRED for create-or-update by email/phone (REST POST /contacts/upsert)
   - ghl_search             → Search CRM records across the connected location
   - ghl_fetch              → Fetch complete records by ID
   - ghl_search_operations  → Discover any permitted HighLevel API operation by intent
   - ghl_describe_operation → Retrieve the required schema for an operation
-  - ghl_execute_operation  → Execute a discovered operation using the described schema
+  - ghl_execute_operation  → Execute any OTHER discovered operation using the described schema
   - The v2 operation catalog covers all domains granted by the connected OAuth/PIT scopes.
   - GHL tools use per-request tenant credentials and remain restricted to one location.
+  - For contact creation, use ghl_contacts_create_contact / ghl_contacts_upsert_contact,
+    NOT ghl_execute_operation. There is no dry-run/preview mode anywhere; never send a
+    dry_run flag. Confirm intent with the user before the single real write.
 
 Stripe tools (namespace: stripe_):
   - stripe_ensure_customer_profile               → Create/update customer before showing full lead details
@@ -2268,6 +2298,259 @@ orchestrator.mount(ghl_proxy, namespace="ghl")
 # available as an opt-in compatibility mode for constrained deployments.
 if os.getenv("GHL_V2_TOOL_ALLOWLIST_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
     orchestrator.add_middleware(GHLToolAllowlistMiddleware())
+
+# ── Deterministic GHL contact creation (direct REST, bypasses v2 execute_operation) ──
+GHL_REST_BASE_URL = os.getenv(
+    "GHL_API_BASE_URL", "https://services.leadconnectorhq.com"
+).strip().rstrip("/")
+
+
+def _resolve_ghl_rest_credentials() -> tuple[str, str, str]:
+    """Resolve (authorization, location_id, version) for a direct REST call.
+
+    Per-request tenant headers take precedence over the static env defaults, reusing the
+    same precedence/normalisation as the proxied transport ([[build-ghl-tenant-headers]]).
+    """
+    incoming = get_http_headers(include=set(GHL_TENANT_HEADER_NAMES))
+    tenant = build_ghl_tenant_headers(incoming)
+
+    authorization = (tenant.get("authorization") or default_ghl_headers.get("authorization", "")).strip()
+    location_id = (tenant.get("locationid") or DEFAULT_GHL_LOCATION).strip()
+    version = (tenant.get("version") or DEFAULT_GHL_VERSION or "2021-07-28").strip()
+    return authorization, location_id, version
+
+
+@orchestrator.tool(
+    name="ghl_contacts_create_contact",
+    description=(
+        "Deterministically create a HighLevel contact via the official REST endpoint "
+        "POST /contacts/. PREFER THIS over ghl_execute_operation for contact creation: "
+        "it has a fixed schema, injects the tenant locationId, and returns structured, "
+        "actionable errors. Provide at least one identifier (email or phone). Supported "
+        "fields: firstName, lastName, name, companyName, email, phone, address1, city, "
+        "state, postalCode, country, website, timezone, tags, source, customFields, and "
+        "additionalFields (pass-through for other GHL-accepted keys). locationId is taken "
+        "from the argument, the x-ghl-location-id request header, or GHL_LOCATION_ID. "
+        "There is NO dry-run/preview/validateOnly mode — HighLevel does not support one, "
+        "so this tool performs the real write immediately. Do not send a dry_run flag; "
+        "confirm intent with the user before calling instead."
+    ),
+)
+async def ghl_contacts_create_contact(
+    firstName: str | None = None,
+    lastName: str | None = None,
+    name: str | None = None,
+    companyName: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    address1: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    postalCode: str | None = None,
+    country: str | None = None,
+    website: str | None = None,
+    timezone: str | None = None,
+    tags: list[str] | str | None = None,
+    source: str | None = None,
+    customFields: list[dict[str, Any]] | dict[str, Any] | None = None,
+    additionalFields: dict[str, Any] | None = None,
+    locationId: str | None = None,
+) -> dict[str, Any]:
+    authorization, resolved_location, version = _resolve_ghl_rest_credentials()
+
+    if not authorization:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "auth_error",
+                    "No HighLevel Authorization token available. Provide x-ghl-token per "
+                    "request or set GHL_PIT_TOKEN.",
+                ).to_dict()
+            )
+        )
+
+    fields = {
+        "firstName": firstName,
+        "lastName": lastName,
+        "name": name,
+        "companyName": companyName,
+        "email": email,
+        "phone": phone,
+        "address1": address1,
+        "city": city,
+        "state": state,
+        "postalCode": postalCode,
+        "country": country,
+        "website": website,
+        "timezone": timezone,
+        "source": source,
+    }
+
+    try:
+        body = build_create_contact_body(
+            location_id=locationId or resolved_location,
+            fields=fields,
+            tags=tags,
+            custom_fields=customFields,
+            additional_fields=additionalFields,
+        )
+    except ContactCreateError as err:
+        raise ToolError(json.dumps(err.to_dict())) from err
+
+    headers = {
+        "Authorization": authorization,
+        "Version": version,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        status_code, payload = await _post_create_contact(
+            f"{GHL_REST_BASE_URL}/contacts/", headers=headers, body=body
+        )
+    except httpx.HTTPError as err:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "transport_error",
+                    f"Failed to reach HighLevel REST API: {type(err).__name__}.",
+                ).to_dict()
+            )
+        ) from err
+
+    try:
+        return map_create_contact_response(status_code, payload)
+    except ContactCreateError as err:
+        raise ToolError(json.dumps(err.to_dict())) from err
+
+
+async def _post_create_contact(
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    http_client: httpx.AsyncClient | None = None,
+) -> tuple[int, Any]:
+    """POST the contact body and return (status_code, parsed_json_or_text).
+
+    ``http_client`` may be injected (tests use httpx.MockTransport); otherwise a
+    short-lived client is created per call.
+    """
+    async def _send(client: httpx.AsyncClient) -> tuple[int, Any]:
+        response = await client.post(url, json=body, headers=headers)
+        try:
+            parsed: Any = response.json()
+        except ValueError:
+            parsed = {"raw": response.text}
+        return response.status_code, parsed
+
+    if http_client is not None:
+        return await _send(http_client)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await _send(client)
+
+
+@orchestrator.tool(
+    name="ghl_contacts_upsert_contact",
+    description=(
+        "Deterministically create-or-update a HighLevel contact via the official REST "
+        "endpoint POST /contacts/upsert. Same fixed schema and locationId handling as "
+        "ghl_contacts_create_contact, but matches on email/phone and updates in place "
+        "instead of returning a 409 duplicate. PREFER THIS over ghl_execute_operation "
+        "when a lead may already exist. No dry-run/preview mode exists; the write is real."
+    ),
+)
+async def ghl_contacts_upsert_contact(
+    firstName: str | None = None,
+    lastName: str | None = None,
+    name: str | None = None,
+    companyName: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    address1: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    postalCode: str | None = None,
+    country: str | None = None,
+    website: str | None = None,
+    timezone: str | None = None,
+    tags: list[str] | str | None = None,
+    source: str | None = None,
+    customFields: list[dict[str, Any]] | dict[str, Any] | None = None,
+    additionalFields: dict[str, Any] | None = None,
+    locationId: str | None = None,
+) -> dict[str, Any]:
+    authorization, resolved_location, version = _resolve_ghl_rest_credentials()
+
+    if not authorization:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "auth_error",
+                    "No HighLevel Authorization token available. Provide x-ghl-token per "
+                    "request or set GHL_PIT_TOKEN.",
+                ).to_dict()
+            )
+        )
+
+    fields = {
+        "firstName": firstName,
+        "lastName": lastName,
+        "name": name,
+        "companyName": companyName,
+        "email": email,
+        "phone": phone,
+        "address1": address1,
+        "city": city,
+        "state": state,
+        "postalCode": postalCode,
+        "country": country,
+        "website": website,
+        "timezone": timezone,
+        "source": source,
+    }
+
+    try:
+        body = build_create_contact_body(
+            location_id=locationId or resolved_location,
+            fields=fields,
+            tags=tags,
+            custom_fields=customFields,
+            additional_fields=additionalFields,
+        )
+    except ContactCreateError as err:
+        raise ToolError(json.dumps(err.to_dict())) from err
+
+    headers = {
+        "Authorization": authorization,
+        "Version": version,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        status_code, payload = await _post_create_contact(
+            f"{GHL_REST_BASE_URL}/contacts/upsert", headers=headers, body=body
+        )
+    except httpx.HTTPError as err:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "transport_error",
+                    f"Failed to reach HighLevel REST API: {type(err).__name__}.",
+                ).to_dict()
+            )
+        ) from err
+
+    try:
+        result = map_create_contact_response(status_code, payload)
+    except ContactCreateError as err:
+        raise ToolError(json.dumps(err.to_dict())) from err
+
+    # Upsert reports whether the record was new; reflect update vs create in the status.
+    if isinstance(payload, dict) and payload.get("new") is False:
+        result["status"] = "updated"
+    return result
 
 # ── OAuth routes (GoHighLevel Marketplace install flow) ──────────────────────
 @orchestrator.custom_route("/oauth/ghl/start", methods=["GET"])
