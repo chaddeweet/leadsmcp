@@ -105,6 +105,9 @@ async def test_downstream_get_forwards_x_api_key(monkeypatch):
     captured: dict[str, object] = {}
 
     class _FakeResponse:
+        status_code = 200
+        headers: dict = {}
+
         def raise_for_status(self):
             return None
 
@@ -142,6 +145,9 @@ async def test_downstream_post_forwards_x_api_key(monkeypatch):
     captured: dict[str, object] = {}
 
     class _FakeResponse:
+        status_code = 200
+        headers: dict = {}
+
         def raise_for_status(self):
             return None
 

@@ -30,51 +30,110 @@ import asyncio
 import httpx
 from typing import Optional
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
+
+from servers.http_retry import request_with_retries
 
 mcp = FastMCP(name="Outscraper")
 
 BASE_URL = "https://api.outscraper.cloud"
 
+# Outscraper caps sustained throughput (~20 QPS average, service dependent) and
+# returns HTTP 429 when exceeded. Requests here are read-only search/enrichment
+# lookups, so re-issuing them on a transient failure is safe.
+_HTTP_TIMEOUT = 60.0
+
+
+def _resolve_api_key() -> str:
+    """Resolve the Outscraper API key for the current request.
+
+    Precedence:
+      1) inbound ``x-api-key`` HTTP header (per-request, multi-tenant)
+      2) ``OUTSCRAPER_API_KEY`` environment variable (optional fallback)
+
+    The header always wins when present. Raises a clear error if neither
+    source yields a key. The key value is never logged or persisted.
+    """
+    header_key = get_http_headers(include={"x-api-key"}).get("x-api-key")
+    if header_key and header_key.strip():
+        return header_key.strip()
+
+    env_key = os.getenv("OUTSCRAPER_API_KEY", "")
+    if env_key and env_key.strip():
+        return env_key.strip()
+
+    raise RuntimeError(
+        "Missing Outscraper API key. Send it as the 'x-api-key' request header "
+        "from your MCP client, or set the OUTSCRAPER_API_KEY environment variable."
+    )
+
+
 def _headers() -> dict:
-    return {"X-API-KEY": os.getenv("OUTSCRAPER_API_KEY", "")}
+    return {"X-API-KEY": _resolve_api_key()}
 
 
 def _with_outscraper_defaults(params: dict) -> dict:
-    """Ensure every Outscraper request defaults async=false and ui=false.
+    """Force every Outscraper request to run synchronously and headless.
 
-    Applied to both query params and JSON payloads. User-supplied values are
-    preserved; only missing keys are filled in.
+    ``async`` and ``ui`` are always pinned to ``"false"`` regardless of any
+    caller-supplied value:
+      - ``async=false`` keeps the HTTP connection open and returns results
+        inline, so no follow-up polling is required.
+      - ``ui=false`` prevents Outscraper from promoting the task to a UI task
+        (which would silently force ``async`` back to ``true``).
     """
     normalized = dict(params or {})
-    normalized.setdefault("async", "false")
-    normalized.setdefault("ui", "false")
+    normalized["async"] = "false"
+    normalized["ui"] = "false"
     return normalized
 
+
 async def _get(endpoint: str, params: dict) -> dict:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.get(f"{BASE_URL}{endpoint}", headers=_headers(), params=_with_outscraper_defaults(params))
-        r.raise_for_status()
-        return r.json()
+    headers = _headers()
+    normalized = _with_outscraper_defaults(params)
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            return await client.get(f"{BASE_URL}{endpoint}", headers=headers, params=normalized)
+
+    r = await request_with_retries(_send)
+    r.raise_for_status()
+    return r.json()
+
 
 async def _post(endpoint: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(
-            f"{BASE_URL}{endpoint}",
-            headers={**_headers(), "Content-Type": "application/json"},
-            json=_with_outscraper_defaults(payload),
-        )
-        r.raise_for_status()
-        return r.json()
+    headers = {**_headers(), "Content-Type": "application/json"}
+    normalized = _with_outscraper_defaults(payload)
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            return await client.post(f"{BASE_URL}{endpoint}", headers=headers, json=normalized)
+
+    r = await request_with_retries(_send)
+    r.raise_for_status()
+    return r.json()
+
 
 async def _poll(request_id: str, max_wait: int = 300) -> dict:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for _ in range(max_wait // 10):
-            await asyncio.sleep(10)
-            r = await client.get(f"{BASE_URL}/requests/{request_id}", headers=_headers())
-            data = r.json()
-            if data.get("status") in ("Success", "Failure"):
-                return data
-        return {"status": "Timeout", "data": []}
+    """Poll a previously-submitted async request until it settles.
+
+    Synchronous (async=false) calls return inline, so this is only needed for
+    legacy/async responses that handed back a ``request_id``. Polling itself is
+    a GET, so transient failures are retried without disturbing the interval.
+    """
+    headers = _headers()
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            return await client.get(f"{BASE_URL}/requests/{request_id}", headers=headers)
+
+    for _ in range(max_wait // 10):
+        await asyncio.sleep(10)
+        r = await request_with_retries(_send)
+        data = r.json()
+        if data.get("status") in ("Success", "Failure"):
+            return data
+    return {"status": "Timeout", "data": []}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GOOGLE MAPS & SEARCH

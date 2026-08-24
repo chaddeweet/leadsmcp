@@ -223,7 +223,7 @@ async def test_tool_create_contact_success(monkeypatch):
     )
 
     async def fake_post(url, *, headers, body, http_client=None):
-        assert url.endswith("/contacts/")
+        assert url.endswith("/contacts/upsert")
         assert body["locationId"] == "LOC-DEFAULT"  # injected from resolved creds
         return 201, {"contact": {"id": "C-100"}}
 
@@ -231,7 +231,12 @@ async def test_tool_create_contact_success(monkeypatch):
 
     async with Client(main.orchestrator) as c:
         res = await c.call_tool(
-            "ghl_contacts_create_contact", {"email": "jane@example.com", "firstName": "Jane"}
+            "crm_import_contact",
+            {
+                "email": "jane@example.com",
+                "firstName": "Jane",
+                "confirm": True,
+            },
         )
     assert res.structured_content["contactId"] == "C-100"
     assert res.structured_content["status"] == "created"
@@ -249,7 +254,10 @@ async def test_tool_create_contact_missing_location_raises(monkeypatch):
 
     async with Client(main.orchestrator) as c:
         with pytest.raises(ToolError) as exc:
-            await c.call_tool("ghl_contacts_create_contact", {"email": "a@b.com"})
+            await c.call_tool(
+                "crm_import_contact",
+                {"email": "a@b.com", "confirm": True},
+            )
     assert "missing_location" in str(exc.value)
 
 
@@ -271,7 +279,10 @@ async def test_tool_create_contact_scope_failure_maps_error(monkeypatch):
 
     async with Client(main.orchestrator) as c:
         with pytest.raises(ToolError) as exc:
-            await c.call_tool("ghl_contacts_create_contact", {"phone": "+15551234567"})
+            await c.call_tool(
+                "crm_import_contact",
+                {"phone": "+15551234567", "confirm": True},
+            )
     message = str(exc.value)
     assert "scope_or_location_error" in message
     assert "pit-leak" not in message  # secret redacted end-to-end
@@ -294,6 +305,9 @@ async def test_tool_upsert_reports_updated(monkeypatch):
     monkeypatch.setattr(main, "_post_create_contact", fake_post)
 
     async with Client(main.orchestrator) as c:
-        res = await c.call_tool("ghl_contacts_upsert_contact", {"email": "a@b.com"})
+        res = await c.call_tool(
+            "crm_import_contact",
+            {"email": "a@b.com", "confirm": True},
+        )
     assert res.structured_content["status"] == "updated"
     assert res.structured_content["contactId"] == "C-5"

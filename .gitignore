@@ -9,3 +9,19 @@ build/
 venv/
 .DS_Store
 .vercel
+
+# macOS AppleDouble / metadata junk
+._*
+
+# Build caches, archives, logs, and temporary backups
+leadsmcp-build-cache/
+exported-assets/
+*.tgz
+*.zip
+*.tar.gz
+*.patch
+*.codexbak
+*.log
+gitignore.txt
+
+.env*

@@ -1,0 +1,1178 @@
+{
+  "generated_from": "servers.outscraper_server, servers.stripe_server, servers.tempmail_server",
+  "manifest_version": 1,
+  "tool_count": 38,
+  "tools": [
+    {
+      "description": "Validate email addresses \u2014 checks deliverability, spam traps, blacklists.\nReturns RECEIVING / UNKNOWN / INVALID per email.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "emails": {
+            "description": "Comma-separated e.g. 'john@acme.com,jane@corp.com'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "emails"
+        ],
+        "type": "object"
+      },
+      "local_name": "email_validator",
+      "name": "outscraper_email_validator",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Find email addresses, social links, and phones from domains.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "contacts_per_company": {
+            "default": 3,
+            "description": "Number of contacts per domain",
+            "type": "integer"
+          },
+          "domains": {
+            "description": "Comma-separated domains e.g. 'apple.com,tesla.com'",
+            "type": "string"
+          },
+          "emails_per_contact": {
+            "default": 1,
+            "description": "Number of emails per contact",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "domains"
+        ],
+        "type": "object"
+      },
+      "local_name": "emails_and_contacts",
+      "name": "outscraper_emails_and_contacts",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Convert address to coordinates (latitude, longitude).",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "address": {
+            "description": "Full address string e.g. '1600 Amphitheatre Parkway, Mountain View, CA'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "type": "object"
+      },
+      "local_name": "geocoding",
+      "name": "outscraper_geocoding",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Retrieve results of a previously submitted async Outscraper request.\nPolls until complete (max 5 min). Use when a prior tool returned a request_id.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "description": "The ID returned by a previous async Outscraper call",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "get_request_results",
+      "name": "outscraper_get_request_results",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get Google Maps reviews for a business.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "description": "Business name/Place ID e.g. 'Starbucks, Manhattan, NY, USA'",
+            "type": "string"
+          },
+          "reviews_limit": {
+            "default": 10,
+            "description": "Number of reviews (default 10)",
+            "type": "integer"
+          },
+          "sort": {
+            "default": "newest",
+            "description": "'newest' | 'most_relevant' | 'highest_rating' | 'lowest_rating'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "google_maps_reviews",
+      "name": "outscraper_google_maps_reviews",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search Google Maps for businesses/POIs.\nReturns: name, address, phone, website, rating, reviews count, coordinates, hours.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "enrichments": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Comma-separated \u2014 e.g. 'contacts_n_leads,company_insights_service'"
+          },
+          "language": {
+            "default": "en",
+            "description": "Language code \u2014 default 'en'",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Max results 1\u2013500 (default 20)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "e.g. 'plumbers, Johannesburg, ZA' or 'dentists, Cape Town, ZA'",
+            "type": "string"
+          },
+          "region": {
+            "default": "US",
+            "description": "ISO country code e.g. 'ZA', 'US', 'GB'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "google_maps_search",
+      "name": "outscraper_google_maps_search",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Perform a Google Search \u2014 returns organic results, ads, related queries.\nUseful for researching prospects before outreach.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "language": {
+            "default": "en",
+            "description": "Language code",
+            "type": "string"
+          },
+          "pages_per_query": {
+            "default": 1,
+            "description": "Result pages (default 1)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Any search string",
+            "type": "string"
+          },
+          "region": {
+            "default": "US",
+            "description": "Country code for localised results",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "google_search",
+      "name": "outscraper_google_search",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search Google News for news articles.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "language": {
+            "default": "en",
+            "description": "Language code",
+            "type": "string"
+          },
+          "pages_per_query": {
+            "default": 1,
+            "description": "Number of pages to retrieve",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Search term for news",
+            "type": "string"
+          },
+          "region": {
+            "default": "US",
+            "description": "Country code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "google_search_news",
+      "name": "outscraper_google_search_news",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get Google Trends data for search terms.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "language": {
+            "default": "en",
+            "description": "Language code",
+            "type": "string"
+          },
+          "query": {
+            "description": "Search term(s) to analyze trends",
+            "type": "string"
+          },
+          "region": {
+            "default": "US",
+            "description": "Country code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "google_trends",
+      "name": "outscraper_google_trends",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search LinkedIn companies.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Max results (default 10)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Company name, URL or ID e.g. 'https://www.linkedin.com/company/outscraper' or 'outscraper'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "linkedin_companies",
+      "name": "outscraper_linkedin_companies",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get posts from LinkedIn companies.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Number of posts to retrieve",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Company URL or ID e.g. 'https://www.linkedin.com/company/outscraper' or 'outscraper'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "linkedin_posts",
+      "name": "outscraper_linkedin_posts",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get LinkedIn person profiles.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Max results (default 10)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Profile URL or username e.g. 'https://www.linkedin.com/in/realvlad' or 'realvlad'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "linkedin_profiles",
+      "name": "outscraper_linkedin_profiles",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Enrich phone numbers \u2014 carrier name, type (mobile/landline), ownership info.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "phones": {
+            "description": "Comma-separated E.164 numbers e.g. '+27113456789,+14155550123'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "phones"
+        ],
+        "type": "object"
+      },
+      "local_name": "phones_enricher",
+      "name": "outscraper_phones_enricher",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get current account balance and usage information.\nReturns credits remaining and account status.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "local_name": "profile_balance",
+      "name": "outscraper_profile_balance",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Convert coordinates to address.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "coordinates": {
+            "description": "Latitude,longitude e.g. '37.4224764,-122.0842499'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "coordinates"
+        ],
+        "type": "object"
+      },
+      "local_name": "reverse_geocoding",
+      "name": "outscraper_reverse_geocoding",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get website analytics from SimilarWeb \u2014 traffic, rankings, audience insights.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "domains": {
+            "description": "Comma-separated domains e.g. 'apple.com,tesla.com'",
+            "type": "string"
+          }
+        },
+        "required": [
+          "domains"
+        ],
+        "type": "object"
+      },
+      "local_name": "similarweb",
+      "name": "outscraper_similarweb",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search TikTok user profiles.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Max results (default 10)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Username or search term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "tiktok_profiles",
+      "name": "outscraper_tiktok_profiles",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search Twitter/X user profiles.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Max results (default 10)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Username or search term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "twitter_profiles",
+      "name": "outscraper_twitter_profiles",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Search YouTube videos.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 10,
+            "description": "Max results (default 10)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "Search term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "local_name": "youtube_search",
+      "name": "outscraper_youtube_search",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get transcript/captions from YouTube video.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "video_url": {
+            "description": "YouTube video URL or ID",
+            "type": "string"
+          }
+        },
+        "required": [
+          "video_url"
+        ],
+        "type": "object"
+      },
+      "local_name": "youtube_transcripts",
+      "name": "outscraper_youtube_transcripts",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Get videos from a YouTube channel.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "channel_url": {
+            "description": "Channel URL or username",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Max videos (default 10)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "channel_url"
+        ],
+        "type": "object"
+      },
+      "local_name": "youtube_videos",
+      "name": "outscraper_youtube_videos",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "outscraper"
+    },
+    {
+      "description": "Analyze lead payloads and calculate billable qualified leads by company.\n\nQualification rule:\n  full_name AND job_title AND (verified_email OR verified_phone)",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "companies": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "max_sample_leads": {
+            "default": 10,
+            "type": "integer"
+          },
+          "unit_price_usd": {
+            "default": 0.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "companies"
+        ],
+        "type": "object"
+      },
+      "local_name": "analyze_qualified_lead_export",
+      "name": "stripe_analyze_qualified_lead_export",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Create a Stripe Checkout session for a metered subscription.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cancel_url": {
+            "type": "string"
+          },
+          "price_id": {
+            "default": "",
+            "type": "string"
+          },
+          "stripe_customer_id": {
+            "type": "string"
+          },
+          "success_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stripe_customer_id",
+          "success_url",
+          "cancel_url"
+        ],
+        "type": "object"
+      },
+      "local_name": "create_usage_checkout_session",
+      "name": "stripe_create_usage_checkout_session",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Create or update a Stripe customer profile for LeadsMCP.\nUse this before showing full lead results or allowing CRM export.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "first_name": {
+            "type": "string"
+          },
+          "full_name": {
+            "default": "",
+            "type": "string"
+          },
+          "last_name": {
+            "type": "string"
+          },
+          "phone": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "first_name",
+          "last_name"
+        ],
+        "type": "object"
+      },
+      "local_name": "ensure_customer_profile",
+      "name": "stripe_ensure_customer_profile",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Estimate export cost.\n\nCompatibility behavior:\n- If `qualified_leads` is provided, uses flat per-qualified-lead pricing.\n- Else, if `leads_exported` is provided, uses legacy graduated estimation.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "leads_exported": {
+            "default": 0,
+            "type": "integer"
+          },
+          "qualified_leads": {
+            "default": 0,
+            "type": "integer"
+          },
+          "unit_price_usd": {
+            "default": 0.0,
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "local_name": "estimate_qualified_lead_export_cost",
+      "name": "stripe_estimate_qualified_lead_export_cost",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Check if a customer has an active/trialing subscription for export access.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "price_id": {
+            "default": "",
+            "type": "string"
+          },
+          "stripe_customer_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stripe_customer_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "get_customer_export_access",
+      "name": "stripe_get_customer_export_access",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Decide the next billing step for an export batch.\n\nOutcomes:\n- checkout_required\n- permission_required\n- ready_to_export",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "auto_create_checkout": {
+            "default": true,
+            "type": "boolean"
+          },
+          "cancel_url": {
+            "default": "",
+            "type": "string"
+          },
+          "consent_granted": {
+            "default": false,
+            "type": "boolean"
+          },
+          "export_batch_id": {
+            "default": "",
+            "type": "string"
+          },
+          "price_id": {
+            "default": "",
+            "type": "string"
+          },
+          "qualified_leads": {
+            "type": "integer"
+          },
+          "stripe_customer_id": {
+            "type": "string"
+          },
+          "success_url": {
+            "default": "",
+            "type": "string"
+          },
+          "tenant_id": {
+            "default": "",
+            "type": "string"
+          },
+          "unit_price_usd": {
+            "default": 0.0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "stripe_customer_id",
+          "qualified_leads"
+        ],
+        "type": "object"
+      },
+      "local_name": "plan_qualified_lead_export_billing",
+      "name": "stripe_plan_qualified_lead_export_billing",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Record a usage event for qualified lead export billing with batch guards.\n\nRecommended:\n  - pass export_batch_id\n  - pass consent_granted=true when BILLING_CONSENT_MODE=per_batch",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "consent_granted": {
+            "default": false,
+            "type": "boolean"
+          },
+          "event_name": {
+            "default": "",
+            "type": "string"
+          },
+          "export_batch_id": {
+            "default": "",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "default": "",
+            "type": "string"
+          },
+          "leads_exported": {
+            "default": 1,
+            "type": "integer"
+          },
+          "stripe_customer_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "default": "",
+            "type": "string"
+          },
+          "tier_a_leads": {
+            "default": 0,
+            "type": "integer"
+          },
+          "tier_b_leads": {
+            "default": 0,
+            "type": "integer"
+          },
+          "timestamp": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stripe_customer_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "record_qualified_lead_export",
+      "name": "stripe_record_qualified_lead_export",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "stripe"
+    },
+    {
+      "description": "Bulk-create numbered temporary inboxes for one outreach campaign.\n\nCreates '{prefix}-{n}@{domain}' for n in start_index..start_index+count-1.\nInboxes are created sequentially to stay inside RapidAPI rate limits, and a\nfailure on one inbox does not abort the rest \u2014 check 'failed' in the result.\n\nNote: TempMail.so will not reuse a prefix that already exists on a domain,\nand a prefix that was previously created and deleted stays unavailable on\nthat domain. Set unique_suffix=True when re-running a campaign with the same\nprefix, or vary the prefix/domain.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "default": 5,
+            "description": "How many inboxes to create, 1\u201350 (default 5)",
+            "type": "integer"
+          },
+          "domain": {
+            "description": "A domain returned by list_domains",
+            "type": "string"
+          },
+          "lifespan": {
+            "default": 0,
+            "description": "Seconds before auto-expiry \u2014 0, 300, 600, 900, 1200, or 1800",
+            "type": "integer"
+          },
+          "prefix": {
+            "description": "Campaign slug, e.g. 'acme-q3' (result must be 6+ characters)",
+            "type": "string"
+          },
+          "start_index": {
+            "default": 1,
+            "description": "First numeric suffix (default 1) \u2014 resume a partial batch",
+            "type": "integer"
+          },
+          "unique_suffix": {
+            "default": false,
+            "description": "Append a short random token to each name so a re-run of\n           the same campaign does not collide (default False)",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "prefix",
+          "domain"
+        ],
+        "type": "object"
+      },
+      "local_name": "create_campaign_mailboxes",
+      "name": "tempmail_create_campaign_mailboxes",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Create a temporary email inbox for an outreach campaign.\n\nUse for signup verifications, deliverability seed tests, or burner reply\naddresses. The resulting address is \"{name}@{domain}\".",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "domain": {
+            "description": "A domain returned by list_domains",
+            "type": "string"
+          },
+          "lifespan": {
+            "default": 0,
+            "description": "Seconds before auto-expiry \u2014 one of 0, 300, 600, 900, 1200, 1800.\n      0 means a long-lived inbox that does not auto-expire (default).",
+            "type": "integer"
+          },
+          "name": {
+            "description": "Email prefix, e.g. acme-outreach-01 (letters, digits, dashes)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "domain"
+        ],
+        "type": "object"
+      },
+      "local_name": "create_mailbox",
+      "name": "tempmail_create_mailbox",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Delete a single message from a temporary inbox.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          },
+          "mail_id": {
+            "description": "Message ID from list_mails",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "mail_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "delete_mail",
+      "name": "tempmail_delete_mail",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Permanently delete a temporary inbox and its messages.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inbox_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "delete_mailbox",
+      "name": "tempmail_delete_mailbox",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Pull verification codes and confirmation links out of a message.\n\nReturns numeric/alphanumeric OTP candidates plus any http(s) links found in\nthe body, so the agent can complete a signup without parsing raw HTML.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          },
+          "mail_id": {
+            "description": "Message ID from list_mails",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "mail_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "extract_verification_code",
+      "name": "tempmail_extract_verification_code",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "List the temporary-email domains available to your TempMail.so account.\n\nCall this before create_mailbox \u2014 the 'domain' argument must be one of these\nvalues. Free tiers expose a small set; paid tiers expose more.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "local_name": "list_domains",
+      "name": "tempmail_list_domains",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "List every temporary inbox on your TempMail.so account, with IDs and addresses.\n\nUse this to recover inbox IDs for a campaign created in an earlier session.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "local_name": "list_mailboxes",
+      "name": "tempmail_list_mailboxes",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "List all messages received by a temporary inbox (subject, sender, timestamp).",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inbox_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "list_mails",
+      "name": "tempmail_list_mails",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Read the full content of one message \u2014 subject, sender, headers, and body.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          },
+          "mail_id": {
+            "description": "Message ID from list_mails",
+            "type": "string"
+          }
+        },
+        "required": [
+          "inbox_id",
+          "mail_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "read_mail",
+      "name": "tempmail_read_mail",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    },
+    {
+      "description": "Poll an inbox until a matching message arrives or the timeout elapses.\n\nAvoids the agent hand-rolling a retry loop when waiting on a signup\nconfirmation or verification email.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "from_contains": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only match if the sender contains this text (case-insensitive)"
+          },
+          "inbox_id": {
+            "description": "Inbox ID from create_mailbox or list_mailboxes",
+            "type": "string"
+          },
+          "poll_interval_seconds": {
+            "default": 5,
+            "description": "Seconds between checks, 2\u201330 (default 5)",
+            "type": "integer"
+          },
+          "subject_contains": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Only match if the subject contains this text (case-insensitive)"
+          },
+          "timeout_seconds": {
+            "default": 60,
+            "description": "Give up after this long, 5\u2013300 (default 60)",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "inbox_id"
+        ],
+        "type": "object"
+      },
+      "local_name": "wait_for_mail",
+      "name": "tempmail_wait_for_mail",
+      "output_schema": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "server": "tempmail"
+    }
+  ]
+}

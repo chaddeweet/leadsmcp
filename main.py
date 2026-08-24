@@ -5,13 +5,15 @@ Services mounted:
   outscraper_*  →  Outscraper API (Google Maps, email/phone validation, enrichment)
   ghl_*         →  GoHighLevel native MCP (contacts, opportunities, pipelines)
   stripe_*      →  Stripe billing (qualified lead analysis, consent gating, metering)
+  tempmail_*    →  TempMail.so (disposable inboxes for outreach signups/verification)
 
 Start locally:   python3 main.py
 MCP endpoint:    http://localhost:8000/mcp
 Health check:    http://localhost:8000/health
 """
-import contextlib
+import asyncio
 import base64
+import contextlib
 import datetime
 import hashlib
 import hmac
@@ -25,8 +27,6 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import padding as sym_padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastmcp import FastMCP, Client
+from fastmcp.exceptions import ToolError
 from fastmcp.client.transports.http import StreamableHttpTransport
 from fastmcp.server import create_proxy
 from fastmcp.server.dependencies import get_http_headers
@@ -43,17 +44,121 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.requests import Request
 
-from servers import outscraper_server as outscraper_tools
 from servers.outscraper_server import mcp as outscraper_mcp
 from servers.stripe_server import mcp as stripe_mcp
-from support_pages import build_marketplace_search_page
+from servers.tempmail_server import mcp as tempmail_mcp
 from ghl_tools import GHLToolAllowlistMiddleware
+from marketplace_tools import (
+    DEVELOPER_MODE,
+    MarketplaceToolCatalogMiddleware,
+    load_marketplace_mode,
+)
+from ghl_install_store import (
+    get_installation,
+    get_webhook_event,
+    get_wallet_charge,
+    install_store_backend,
+    list_installations,
+    mark_uninstalled,
+    patch_installations,
+    persist_install_record,
+    record_webhook_event,
+    supabase_configured as ghl_install_supabase_configured,
+    upsert_wallet_charge,
+    webhook_event_exists,
+)
+from ghl_marketplace import (
+    MarketplaceAPIError,
+    create_wallet_charge,
+    exchange_location_token,
+    get_installed_locations,
+)
+from ghl_webhooks import verify_ghl_signature, webhook_event_id
 from ghl_contact_create import (
     ContactCreateError,
     build_create_contact_body,
     map_create_contact_response,
 )
-from fastmcp.exceptions import ToolError
+
+import connector_oauth
+
+# Exact request paths that are always public (no x-mcp-secret required). The MCP
+# protocol endpoint itself lives at the exact path "/mcp" and is deliberately not
+# listed here, so it stays protected.
+_PUBLIC_EXACT_PATHS = frozenset({
+    "/",
+    "/health",
+    "/favicon.ico",
+    "/support",
+    "/support/",
+    "/contact",
+    "/contact/",
+    "/app-install-successfully",
+    "/app-install-successfully/",
+    "/oauth/ghl/start",
+    "/oauth/ghl/callback",
+    "/leadsmcp/install",
+    "/leadsmcp-install",
+    "/leadsmcp-install/",
+    "/webhooks/ghl",
+})
+
+# OAuth discovery / DCR / authorize / token endpoints. These must be reachable
+# without an x-mcp-secret so ChatGPT and Perplexity can complete the OAuth flow.
+_CONNECTOR_PUBLIC_PATHS = frozenset({
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/mcp.json",
+    "/register",
+    "/authorize",
+    "/token",
+    "/oauth/connector/authorize",
+    "/oauth/connector/approve",
+    "/oauth/connector/token",
+})
+
+
+def _is_public_path(path: str) -> bool:
+    """True for public routes served without an x-mcp-secret header.
+
+    The exact "/mcp" protocol endpoint is intentionally excluded so the MCP
+    transport stays authenticated.
+    """
+    if path in _PUBLIC_EXACT_PATHS or path in _CONNECTOR_PUBLIC_PATHS:
+        return True
+    # OAuth discovery must stay public, including the RFC 8414/9728
+    # path-suffixed variants (e.g. /.well-known/oauth-protected-resource/mcp)
+    # that spec-2025-06-18 MCP clients such as Perplexity probe first.
+    if path.startswith("/.well-known/") or path.startswith("/mcp/.well-known/"):
+        return True
+    return False
+
+
+# Retired experimental UI/API paths. They have no handlers, but the auth gate
+# would otherwise turn a request for them into a 401 instead of a clean 404.
+# Let them bypass the secret check so routing resolves them to a clean 404. They
+# expose no content: there is no handler to reach.
+RETIRED_PATHS = frozenset({
+    "/app/lead-search",
+    "/app/lead-search/",
+    "/app/mapbox-style.json",
+    "/app/onboarding",
+    "/app/onboarding/",
+    "/marketplace/onboarding",
+    "/marketplace/onboarding/",
+    "/api/marketplace/user-context",
+    "/api/marketplace/lead-search",
+    "/api/marketplace/geocode",
+    "/api/marketplace/llm-chat",
+    "/api/onboarding-chat",
+    "/mcp/app/pwa",
+    "/mcp/app/pwa/",
+    "/mcp/app/manifest.webmanifest",
+    "/mcp/app/sw.js",
+    "/mcp/app/icon-192.png",
+    "/mcp/app/icon-512.png",
+    "/mcp/app/mapbox-style.json",
+})
 
 
 def _html_shell(*, title: str, body: str) -> str:
@@ -292,95 +397,169 @@ def build_install_success_page(*, base_url: str, github_url: str, install_url: s
 
 
 class MCPSecretMiddleware(BaseHTTPMiddleware):
-    """Require x-mcp-secret for non-public routes when MCP_SECRET is configured."""
+    """Gate non-public routes.
+
+    Authentication precedence for protected routes:
+      1) A valid connector OAuth Bearer access token (when connector OAuth is on).
+      2) The legacy ``x-mcp-secret`` header matching ``MCP_SECRET``.
+    When neither is present the request is rejected. For the ``/mcp`` resource a
+    ``WWW-Authenticate`` challenge pointing at the protected-resource metadata is
+    returned so MCP clients can bootstrap discovery + Dynamic Client Registration.
+    """
 
     async def dispatch(self, request: Request, call_next):
-        required_secret = os.getenv("MCP_SECRET", "").strip()
-        if not required_secret:
-            return await call_next(request)
-
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        if request.url.path in {
-            "/",
-            "/health",
-            "/support",
-            "/support/",
-            "/contact",
-            "/contact/",
-            "/app-install-successfully",
-            "/app-install-successfully/",
-            "/app/lead-search",
-            "/app/lead-search/",
-            "/app/onboarding",
-            "/app/onboarding/",
-            "/api/marketplace/user-context",
-            "/api/marketplace/lead-search",
-            "/api/marketplace/llm-chat",
-            "/api/onboarding-chat",
-            "/oauth/ghl/start",
-            "/oauth/ghl/callback",
-            "/leadsmcp/install",
-            "/leadsmcp-install",
-            "/leadsmcp-install/",
-        }:
+        path = request.url.path
+
+        # Retired paths fall through to routing (-> 404) instead of the 401 gate.
+        if path in RETIRED_PATHS:
             return await call_next(request)
 
-        provided_secret = request.headers.get("x-mcp-secret", "").strip()
-        if not provided_secret or provided_secret != required_secret:
-            return JSONResponse(
-                {
-                    "error": "Unauthorized",
-                    "message": "Missing or invalid x-mcp-secret header.",
-                },
-                status_code=401,
+        if _is_public_path(path):
+            return await call_next(request)
+
+        required_secret = os.getenv("MCP_SECRET", "").strip()
+        oauth_on = connector_oauth.connector_oauth_enabled()
+
+        # No auth configured at all -> preserve historical open behavior.
+        if not required_secret and not oauth_on:
+            return await call_next(request)
+
+        # 1) Connector OAuth Bearer access token.
+        if oauth_on:
+            auth_header = request.headers.get("authorization", "").strip()
+            if auth_header.lower().startswith("bearer "):
+                bearer = auth_header[7:].strip()
+                token_record = await connector_oauth.validate_bearer(bearer)
+                if token_record:
+                    token_data = token_record.get("data") or {}
+                    if isinstance(token_data, str):
+                        try:
+                            token_data = json.loads(token_data)
+                        except (json.JSONDecodeError, ValueError):
+                            token_data = {}
+                    binding = token_data.get("installation") or {}
+                    install_key = str(binding.get("install_key") or "").strip()
+                    if LEADSMCP_MODE != DEVELOPER_MODE and not install_key:
+                        return JSONResponse(
+                            {
+                                "error": "installation_required",
+                                "message": "Connector token is not bound to a CRM installation.",
+                            },
+                            status_code=403,
+                        )
+                    if install_key:
+                        installation = await get_installation(install_key=install_key)
+                        if not installation:
+                            return JSONResponse(
+                                {
+                                    "error": "installation_unavailable",
+                                    "message": "The bound CRM installation is unavailable.",
+                                },
+                                status_code=403,
+                            )
+                        if installation.get("payment_status") == "FAILED":
+                            return JSONResponse(
+                                {
+                                    "error": "subscription_inactive",
+                                    "message": "Marketplace subscription payment is inactive.",
+                                },
+                                status_code=402,
+                            )
+                        ghl_access_token = _decrypt_from_store(
+                            str(installation.get("access_token_encrypted") or "")
+                        )
+                        location_id = str(
+                            installation.get("location_id") or ""
+                        ).strip()
+                        if not ghl_access_token or not location_id:
+                            return JSONResponse(
+                                {
+                                    "error": "location_authorization_required",
+                                    "message": "A location-level CRM authorization is required.",
+                                },
+                                status_code=403,
+                            )
+                        request.scope["headers"] = [
+                            *request.scope.get("headers", []),
+                            (b"x-ghl-token", ghl_access_token.encode("utf-8")),
+                            (
+                                b"x-ghl-location-id",
+                                location_id.encode("utf-8"),
+                            ),
+                        ]
+                        request.state.ghl_installation = installation
+                    return await call_next(request)
+
+        # 2) Legacy x-mcp-secret compatibility.
+        if required_secret:
+            provided_secret = request.headers.get("x-mcp-secret", "").strip()
+            if provided_secret and hmac.compare_digest(provided_secret, required_secret):
+                return await call_next(request)
+
+        return self._unauthorized(request, oauth_on)
+
+    @staticmethod
+    def _unauthorized(request: Request, oauth_on: bool) -> JSONResponse:
+        headers: dict[str, str] = {}
+        is_mcp = request.url.path == "/mcp" or request.url.path.startswith("/mcp/")
+        if oauth_on and is_mcp:
+            base = _public_base_url(request)
+            headers["WWW-Authenticate"] = connector_oauth.www_authenticate_challenge(
+                base, error="invalid_token", description="Missing or invalid access token."
             )
-        return await call_next(request)
+        return JSONResponse(
+            {
+                "error": "Unauthorized",
+                "message": "Provide a valid OAuth Bearer token or x-mcp-secret header.",
+            },
+            status_code=401,
+            headers=headers,
+        )
 
 
-GHL_TENANT_HEADER_NAMES = frozenset(
-    {
-        "authorization",
-        "locationid",
-        "version",
-        "x-ghl-token",
-        "x-ghl-location-id",
-        "x-ghl-version",
-    }
-)
-
-
-def build_ghl_tenant_headers(incoming_headers: dict[str, str]) -> dict[str, str]:
-    """Map inbound request headers to the upstream GHL header names.
-
-    Pure and side-effect free so the tenant-credential precedence can be unit tested
-    without a live MCP session. Precedence per field:
-      1) x-ghl-* tenant override
-      2) native GHL header (authorization / locationid / version)
-    The bearer token is normalised to ``Bearer <token>`` exactly once. Only headers that
-    resolve to a value are returned; callers merge these over the static env defaults so
-    an absent tenant header falls back to the server default.
-    """
+def build_ghl_tenant_headers(
+    incoming_headers: dict[str, str],
+) -> dict[str, str]:
+    """Normalize tenant-specific GHL headers with explicit precedence."""
     tenant_headers: dict[str, str] = {}
-
-    ghl_token = incoming_headers.get("x-ghl-token") or incoming_headers.get("authorization")
+    ghl_token = incoming_headers.get("x-ghl-token") or incoming_headers.get(
+        "authorization"
+    )
     if ghl_token:
         normalized_token = ghl_token.strip()
-        if normalized_token and not normalized_token.lower().startswith("bearer "):
+        if (
+            normalized_token
+            and not normalized_token.lower().startswith("bearer ")
+        ):
             normalized_token = f"Bearer {normalized_token}"
         if normalized_token:
             tenant_headers["authorization"] = normalized_token
 
-    ghl_location = incoming_headers.get("x-ghl-location-id") or incoming_headers.get("locationid")
+    ghl_location = incoming_headers.get(
+        "x-ghl-location-id"
+    ) or incoming_headers.get("locationid")
     if ghl_location:
         tenant_headers["locationid"] = ghl_location.strip()
 
-    ghl_version = incoming_headers.get("x-ghl-version") or incoming_headers.get("version")
+    ghl_version = incoming_headers.get(
+        "x-ghl-version"
+    ) or incoming_headers.get("version")
     if ghl_version:
         tenant_headers["version"] = ghl_version.strip()
-
     return tenant_headers
+
+
+GHL_TENANT_HEADER_NAMES = {
+    "authorization",
+    "locationid",
+    "version",
+    "x-ghl-token",
+    "x-ghl-location-id",
+    "x-ghl-version",
+}
 
 
 class GHLTenantAwareTransport(StreamableHttpTransport):
@@ -394,10 +573,18 @@ class GHLTenantAwareTransport(StreamableHttpTransport):
 
     @contextlib.asynccontextmanager
     async def connect_session(self, **session_kwargs) -> AsyncIterator[ClientSession]:
-        incoming_headers = get_http_headers(include=set(GHL_TENANT_HEADER_NAMES))
+        incoming_headers = get_http_headers(
+            include={
+                "authorization",
+                "locationid",
+                "version",
+                "x-ghl-token",
+                "x-ghl-location-id",
+                "x-ghl-version",
+            }
+        )
 
         tenant_headers = build_ghl_tenant_headers(incoming_headers)
-
         headers = self.headers | tenant_headers
 
         timeout: httpx.Timeout | None = None
@@ -554,7 +741,7 @@ def _latest_install_record(*, location_id: str = "", company_id: str = "") -> di
     return None
 
 
-def _persist_ghl_install_record(
+async def _persist_ghl_install_record(
     *,
     token_payload: dict[str, Any],
     redirect_uri: str,
@@ -573,9 +760,14 @@ def _persist_ghl_install_record(
     access_token = str(token_payload.get("access_token") or "").strip()
     refresh_token = str(token_payload.get("refresh_token") or "").strip()
 
+    encrypted_access = _encrypt_for_store(access_token) if access_token else ""
     encrypted_refresh = _encrypt_for_store(refresh_token) if refresh_token else ""
     access_fingerprint = hashlib.sha256(access_token.encode("utf-8")).hexdigest() if access_token else ""
     install_key = f"{company_id}:{location_id}" if company_id or location_id else ""
+    if not install_key or not access_token:
+        raise ValueError(
+            "OAuth token response is missing the installation identity or access token."
+        )
 
     state_tenant_id = ""
     state_customer_id = ""
@@ -601,27 +793,139 @@ def _persist_ghl_install_record(
         "token_type": token_payload.get("token_type"),
         "access_token_expires_in": token_payload.get("expires_in"),
         "access_token_fingerprint_sha256": access_fingerprint,
+        "access_token_encrypted": encrypted_access,
         "refresh_token_encrypted": encrypted_refresh,
+        "installed": True,
+        "uninstalled_at": None,
+        "app_id": str(
+            token_payload.get("appId")
+            or token_payload.get("app_id")
+            or os.getenv("GHL_APP_ID", "")
+        ),
+        "plan_id": str(
+            token_payload.get("planId")
+            or token_payload.get("plan_id")
+            or ""
+        ),
+        "is_bulk_installation": bool(
+            token_payload.get("isBulkInstallation", False)
+        ),
+        "install_to_future_locations": bool(
+            token_payload.get("installToFutureLocations", False)
+        ),
+        "approve_all_locations": bool(
+            token_payload.get("approveAllLocations", False)
+        ),
+        "approved_locations": token_payload.get("approvedLocations") or [],
+        "payment_status": str(
+            token_payload.get("paymentStatus") or "COMPLETE"
+        ),
+        "trial": token_payload.get("trial"),
     }
 
-    path = _install_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    store_result = await persist_install_record(record)
 
     return {
         "stored": True,
-        "store_path": str(path),
+        **store_result,
         "install_key": install_key or None,
         "location_id": str(location_id or ""),
         "company_id": str(company_id or ""),
     }
 
 
+async def _provision_bulk_locations(
+    *,
+    token_payload: dict[str, Any],
+    redirect_uri: str,
+) -> dict[str, Any]:
+    user_type = str(
+        token_payload.get("userType")
+        or token_payload.get("user_type")
+        or ""
+    ).lower()
+    is_bulk = bool(token_payload.get("isBulkInstallation"))
+    if user_type != "company" and not is_bulk:
+        return {"attempted": False, "provisioned": 0, "errors": []}
+
+    company_id = str(
+        token_payload.get("companyId")
+        or token_payload.get("company_id")
+        or ""
+    ).strip()
+    app_id = str(
+        token_payload.get("appId")
+        or token_payload.get("app_id")
+        or os.getenv("GHL_APP_ID", "")
+    ).strip()
+    agency_access_token = str(
+        token_payload.get("access_token") or ""
+    ).strip()
+    if not company_id or not app_id or not agency_access_token:
+        return {
+            "attempted": True,
+            "provisioned": 0,
+            "errors": ["Company token response is missing companyId, appId, or access_token."],
+        }
+
+    locations = await get_installed_locations(
+        agency_access_token=agency_access_token,
+        company_id=company_id,
+        app_id=app_id,
+    )
+    location_ids = [
+        str(item.get("_id") or item.get("locationId") or "").strip()
+        for item in locations
+        if item.get("isInstalled", True)
+    ]
+    location_ids = [location_id for location_id in location_ids if location_id]
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def provision(location_id: str) -> tuple[str, str]:
+        async with semaphore:
+            try:
+                location_token = await exchange_location_token(
+                    agency_access_token=agency_access_token,
+                    company_id=company_id,
+                    location_id=location_id,
+                )
+                await _persist_ghl_install_record(
+                    token_payload=location_token,
+                    redirect_uri=redirect_uri,
+                    user_type="Location",
+                    state_payload=None,
+                    source="bulk_location_exchange",
+                )
+                return location_id, ""
+            except Exception as exc:
+                return location_id, str(exc)
+
+    results = await asyncio.gather(
+        *(provision(location_id) for location_id in location_ids)
+    )
+    errors = [
+        {"location_id": location_id, "error": error}
+        for location_id, error in results
+        if error
+    ]
+    return {
+        "attempted": True,
+        "discovered": len(location_ids),
+        "provisioned": len(location_ids) - len(errors),
+        "errors": errors,
+    }
+
+
 def _allow_callback_token_response() -> bool:
-    if not _is_production_env():
-        return True
-    return _truthy(os.getenv("GHL_OAUTH_ALLOW_TOKEN_RESPONSE_IN_PRODUCTION", "false"))
+    # Token payload disclosure is disabled in every environment unless a
+    # developer explicitly opts in. Preview deployments often contain real
+    # credentials and must not be treated as safe places to echo tokens.
+    value = os.getenv(
+        "GHL_OAUTH_ALLOW_TOKEN_RESPONSE",
+        os.getenv("GHL_OAUTH_ALLOW_TOKEN_RESPONSE_IN_PRODUCTION", "false"),
+    )
+    return _truthy(value)
 
 
 def _append_query_params(url: str, params: dict[str, str]) -> str:
@@ -645,1407 +949,78 @@ def _coerce_int(value: Any, fallback: int | None = 0) -> int | None:
         return fallback
 
 
-def _ghl_app_shared_secret() -> str:
-    return os.getenv("GHL_APP_SHARED_SECRET", "").strip()
-
-
-def _openssl_evp_bytes_to_key(secret: bytes, salt: bytes, *, key_len: int, iv_len: int) -> tuple[bytes, bytes]:
-    derived = b""
-    block = b""
-    while len(derived) < key_len + iv_len:
-        block = hashlib.md5(block + secret + salt).digest()
-        derived += block
-    return derived[:key_len], derived[key_len : key_len + iv_len]
-
-
-def _decrypt_marketplace_user_context(encrypted_data: str) -> dict[str, Any]:
-    shared_secret = _ghl_app_shared_secret()
-    if not shared_secret:
-        raise ValueError("GHL_APP_SHARED_SECRET is not configured.")
-
-    payload = str(encrypted_data or "").strip()
-    if not payload:
-        raise ValueError("Missing encryptedData.")
-
-    try:
-        blob = base64.b64decode(payload)
-    except Exception as exc:
-        raise ValueError("Invalid encryptedData payload.") from exc
-
-    if not blob.startswith(b"Salted__") or len(blob) <= 16:
-        raise ValueError("Unsupported encryptedData format.")
-
-    salt = blob[8:16]
-    ciphertext = blob[16:]
-    key, iv = _openssl_evp_bytes_to_key(
-        shared_secret.encode("utf-8"),
-        salt,
-        key_len=32,
-        iv_len=16,
-    )
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-
-    unpadder = sym_padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(padded) + unpadder.finalize()
-    try:
-        parsed = json.loads(plaintext.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError("Failed to decode decrypted user context.") from exc
-
-    if not isinstance(parsed, dict):
-        raise ValueError("Marketplace user context was not a JSON object.")
-    return parsed
-
-
-def _marketplace_user_context_summary(user_context: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "userId": str(user_context.get("userId") or "").strip(),
-        "companyId": str(user_context.get("companyId") or "").strip(),
-        "activeLocation": str(
-            user_context.get("activeLocation")
-            or user_context.get("locationId")
-            or ""
-        ).strip(),
-        "type": str(user_context.get("type") or "").strip(),
-        "role": str(user_context.get("role") or "").strip(),
-        "userName": str(user_context.get("userName") or "").strip(),
-        "email": str(user_context.get("email") or "").strip(),
-        "versionId": str(user_context.get("versionId") or "").strip(),
-        "appStatus": str(user_context.get("appStatus") or "").strip(),
-        "isAgencyOwner": bool(user_context.get("isAgencyOwner")),
-    }
-
-
-def _marketplace_llm_model() -> str:
-    configured = os.getenv("LEADSMCP_MARKETPLACE_LLM_MODEL", "").strip()
-    if configured:
-        return configured
-
-    provider = _marketplace_llm_provider()
-    if provider == "google":
-        return "gemini-2.5-flash"
-    if provider == "groq":
-        return "openai/gpt-oss-20b"
-    return "gpt-4o-mini"
-
-
-def _marketplace_llm_provider() -> str:
-    configured = os.getenv("LEADSMCP_MARKETPLACE_LLM_PROVIDER", "").strip().lower()
-    if configured in {"groq", "openai", "google", "gemini"}:
-        return "google" if configured == "gemini" else configured
-
-    if os.getenv("GEMINI_API_KEY", "").strip():
-        return "google"
-
-    if os.getenv("GROQ_API_KEY", "").strip():
-        return "groq"
-    if os.getenv("OPENAI_API_KEY", "").strip():
-        return "openai"
-    return "groq"
-
-
-def _marketplace_llm_config() -> dict[str, str]:
-    provider = _marketplace_llm_provider()
-    model = _marketplace_llm_model()
-
-    if provider == "google":
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not configured for this deployment yet.")
-        return {
-            "provider": "google",
-            "model": model,
-            "api_key": api_key,
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        }
-
-    if provider == "groq":
-        api_key = os.getenv("GROQ_API_KEY", "").strip()
-        if not api_key:
-            raise ValueError("GROQ_API_KEY is not configured for this deployment yet.")
-        return {
-            "provider": "groq",
-            "model": model,
-            "api_key": api_key,
-            "base_url": "https://api.groq.com/openai/v1",
-        }
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not configured for this deployment yet.")
-    return {
-        "provider": "openai",
-        "model": model,
-        "api_key": api_key,
-        "base_url": "",
-    }
-
-
-def _coerce_marketplace_chat_messages(raw_messages: Any) -> list[dict[str, str]]:
-    if not isinstance(raw_messages, list):
-        raise ValueError("Request JSON must include a messages array.")
-
-    cleaned: list[dict[str, str]] = []
-    for item in raw_messages[-12:]:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        if role not in {"user", "assistant"}:
-            continue
-        content = str(item.get("content") or "").strip()
-        if not content:
-            continue
-        cleaned.append({"role": role, "content": content[:6000]})
-
-    if not cleaned:
-        raise ValueError("Provide at least one user or assistant message.")
-    return cleaned
-
-
-async def _marketplace_llm_headers(user_context: dict[str, Any]) -> dict[str, str]:
-    headers: dict[str, str] = {}
-
-    mcp_secret = os.getenv("MCP_SECRET", "").strip()
-    if mcp_secret:
-        headers["x-mcp-secret"] = mcp_secret
-
-    location_id = str(
-        user_context.get("activeLocation")
-        or user_context.get("locationId")
-        or ""
-    ).strip()
-    if location_id:
-        headers["x-ghl-location-id"] = location_id
-
-    ghl_version = os.getenv("GHL_API_VERSION", "2021-07-28").strip()
-    if ghl_version:
-        headers["x-ghl-version"] = ghl_version
-
-    default_token = os.getenv("GHL_PIT_TOKEN", "").strip()
-    if default_token:
-        headers["x-ghl-token"] = default_token
-        return headers
-
-    install_record = _latest_install_record(
-        location_id=location_id,
-        company_id=str(user_context.get("companyId") or "").strip(),
-    )
-    if not install_record:
-        return headers
-
-    encrypted_refresh = str(install_record.get("refresh_token_encrypted") or "").strip()
-    if not encrypted_refresh:
-        return headers
-
-    refresh_token = _decrypt_from_store(encrypted_refresh)
-    refreshed = await _refresh_ghl_access_token(
-        refresh_token=refresh_token,
-        redirect_uri=str(install_record.get("redirect_uri") or _required_env("GHL_OAUTH_REDIRECT_URI")).strip(),
-        user_type=str(install_record.get("user_type") or "Location").strip() or "Location",
-    )
-    access_token = str(refreshed.get("access_token") or "").strip()
-    if access_token:
-        headers["x-ghl-token"] = access_token
-        try:
-            _persist_ghl_install_record(
-                token_payload=refreshed | {
-                    "companyId": install_record.get("company_id") or "",
-                    "locationId": location_id or install_record.get("location_id") or "",
-                    "userId": install_record.get("user_id") or "",
-                },
-                redirect_uri=str(install_record.get("redirect_uri") or "").strip(),
-                user_type=str(install_record.get("user_type") or "Location").strip() or "Location",
-                state_payload={"tenant_id": install_record.get("tenant_id"), "customer_id": install_record.get("customer_id")},
-                source="marketplace_llm_refresh",
-            )
-        except Exception:
-            pass
-
-    return headers
-
-
-def _message_content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "text" and item.get("text"):
-                    parts.append(str(item.get("text")))
-                elif item.get("content"):
-                    parts.append(str(item.get("content")))
-            elif item:
-                parts.append(str(item))
-        return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
-    return str(content or "").strip()
-
-
-MARKETPLACE_SEARCH_TYPES: dict[str, dict[str, Any]] = {
-    "google_maps_search": {
-        "label": "Google Maps Business Search",
-        "description": "Search businesses by niche and geography. Best fit for net-new lead discovery from map listings.",
-        "handler": outscraper_tools.google_maps_search,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Search Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "plumbers, Johannesburg, ZA",
-                "help": "Use business type plus city, region, or country.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 20,
-                "min": 1,
-                "max": 500,
-                "help": "Maximum number of businesses to return.",
-                "span": 4,
-            },
-            {
-                "name": "language",
-                "label": "Language",
-                "type": "text",
-                "required": True,
-                "default": "en",
-                "placeholder": "en",
-                "help": "ISO language code.",
-                "span": 4,
-            },
-            {
-                "name": "region",
-                "label": "Region",
-                "type": "text",
-                "required": True,
-                "default": "US",
-                "placeholder": "US",
-                "help": "ISO country code.",
-                "span": 4,
-            },
-            {
-                "name": "enrichments",
-                "label": "Enrichments",
-                "type": "text",
-                "required": False,
-                "placeholder": "contacts_n_leads,company_insights_service",
-                "help": "Optional comma-separated enrichments supported by Outscraper.",
-                "span": 12,
-            },
-        ],
-    },
-    "google_maps_reviews": {
-        "label": "Google Maps Reviews",
-        "description": "Pull review data for a specific business or place query.",
-        "handler": outscraper_tools.google_maps_reviews,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Business Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "Starbucks, Manhattan, NY, USA",
-                "help": "Use a business name, place query, or place identifier.",
-                "span": 12,
-            },
-            {
-                "name": "reviews_limit",
-                "label": "Reviews Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 250,
-                "help": "How many reviews to retrieve.",
-                "span": 6,
-            },
-            {
-                "name": "sort",
-                "label": "Sort",
-                "type": "text",
-                "required": True,
-                "default": "newest",
-                "placeholder": "newest",
-                "help": "newest, most_relevant, highest_rating, or lowest_rating.",
-                "span": 6,
-            },
-        ],
-    },
-    "emails_and_contacts": {
-        "label": "Website Emails and Contacts",
-        "description": "Scrape websites one domain at a time for email addresses, phones, and social links.",
-        "handler": outscraper_tools.emails_and_contacts,
-        "fields": [
-            {
-                "name": "domains",
-                "label": "Domains",
-                "type": "textarea",
-                "required": True,
-                "rows": 4,
-                "placeholder": "example.com\nanotherdomain.com",
-                "help": "One or more domains. Multiple domains run sequentially.",
-                "span": 12,
-            },
-            {
-                "name": "contacts_per_company",
-                "label": "Contacts Per Company",
-                "type": "number",
-                "required": True,
-                "default": 3,
-                "min": 1,
-                "max": 25,
-                "help": "How many contacts to request for each domain.",
-                "span": 6,
-            },
-            {
-                "name": "emails_per_contact",
-                "label": "Emails Per Contact",
-                "type": "number",
-                "required": True,
-                "default": 1,
-                "min": 1,
-                "max": 10,
-                "help": "How many emails to request per discovered contact.",
-                "span": 6,
-            },
-        ],
-    },
-    "email_validator": {
-        "label": "Email Validator",
-        "description": "Check email deliverability, catch invalid addresses, and review validation status.",
-        "handler": outscraper_tools.email_validator,
-        "fields": [
-            {
-                "name": "emails",
-                "label": "Email Addresses",
-                "type": "textarea",
-                "required": True,
-                "rows": 4,
-                "placeholder": "founder@example.com\nteam@example.org",
-                "help": "One or more email addresses separated by commas, spaces, or new lines.",
-                "span": 12,
-            },
-        ],
-    },
-    "phones_enricher": {
-        "label": "Phone Enricher",
-        "description": "Validate and enrich phone numbers with carrier, type, and ownership data.",
-        "handler": outscraper_tools.phones_enricher,
-        "fields": [
-            {
-                "name": "phones",
-                "label": "Phone Numbers",
-                "type": "textarea",
-                "required": True,
-                "rows": 4,
-                "placeholder": "+14155550123\n+27113456789",
-                "help": "One or more phone numbers, ideally in E.164 format.",
-                "span": 12,
-            },
-        ],
-    },
-    "similarweb": {
-        "label": "Similarweb Domain Intelligence",
-        "description": "Pull website traffic, rankings, and audience insights for one or more domains.",
-        "handler": outscraper_tools.similarweb,
-        "fields": [
-            {
-                "name": "domains",
-                "label": "Domains",
-                "type": "textarea",
-                "required": True,
-                "rows": 4,
-                "placeholder": "apple.com\ntesla.com",
-                "help": "One or more domains separated by commas, spaces, or new lines.",
-                "span": 12,
-            },
-        ],
-    },
-    "geocoding": {
-        "label": "Geocoding",
-        "description": "Convert a full address into coordinates for mapping and spatial workflows.",
-        "handler": outscraper_tools.geocoding,
-        "fields": [
-            {
-                "name": "address",
-                "label": "Address",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "1600 Amphitheatre Parkway, Mountain View, CA",
-                "help": "Enter one full address to geocode.",
-                "span": 12,
-            },
-        ],
-    },
-    "reverse_geocoding": {
-        "label": "Reverse Geocoding",
-        "description": "Turn a latitude and longitude pair into a human-readable address.",
-        "handler": outscraper_tools.reverse_geocoding,
-        "fields": [
-            {
-                "name": "coordinates",
-                "label": "Coordinates",
-                "type": "text",
-                "required": True,
-                "placeholder": "37.4224764,-122.0842499",
-                "help": "Provide one latitude,longitude pair.",
-                "span": 12,
-            },
-        ],
-    },
-    "google_search": {
-        "label": "Google Search Research",
-        "description": "Run a Google web search for prospecting research or company discovery before lead enrichment.",
-        "handler": outscraper_tools.google_search,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Search Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "superyacht brokers in Dubai",
-                "help": "General search query for prospecting research.",
-                "span": 12,
-            },
-            {
-                "name": "pages_per_query",
-                "label": "Pages Per Query",
-                "type": "number",
-                "required": True,
-                "default": 1,
-                "min": 1,
-                "max": 10,
-                "help": "How many search result pages to retrieve.",
-                "span": 4,
-            },
-            {
-                "name": "language",
-                "label": "Language",
-                "type": "text",
-                "required": True,
-                "default": "en",
-                "placeholder": "en",
-                "help": "ISO language code.",
-                "span": 4,
-            },
-            {
-                "name": "region",
-                "label": "Region",
-                "type": "text",
-                "required": True,
-                "default": "US",
-                "placeholder": "US",
-                "help": "ISO country code.",
-                "span": 4,
-            },
-        ],
-    },
-    "google_search_news": {
-        "label": "Google Search News",
-        "description": "Search Google News for recent articles about companies, people, and markets.",
-        "handler": outscraper_tools.google_search_news,
-        "fields": [
-            {
-                "name": "query",
-                "label": "News Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "OpenAI funding news",
-                "help": "Search term for news research.",
-                "span": 12,
-            },
-            {
-                "name": "pages_per_query",
-                "label": "Pages Per Query",
-                "type": "number",
-                "required": True,
-                "default": 1,
-                "min": 1,
-                "max": 10,
-                "help": "How many news result pages to retrieve.",
-                "span": 4,
-            },
-            {
-                "name": "language",
-                "label": "Language",
-                "type": "text",
-                "required": True,
-                "default": "en",
-                "placeholder": "en",
-                "help": "ISO language code.",
-                "span": 4,
-            },
-            {
-                "name": "region",
-                "label": "Region",
-                "type": "text",
-                "required": True,
-                "default": "US",
-                "placeholder": "US",
-                "help": "ISO country code.",
-                "span": 4,
-            },
-        ],
-    },
-    "google_trends": {
-        "label": "Google Trends",
-        "description": "Check search-interest trends for one or more terms.",
-        "handler": outscraper_tools.google_trends,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Trend Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "couples coaching, marriage retreat",
-                "help": "One or more search terms to analyze.",
-                "span": 12,
-            },
-            {
-                "name": "language",
-                "label": "Language",
-                "type": "text",
-                "required": True,
-                "default": "en",
-                "placeholder": "en",
-                "help": "ISO language code.",
-                "span": 6,
-            },
-            {
-                "name": "region",
-                "label": "Region",
-                "type": "text",
-                "required": True,
-                "default": "US",
-                "placeholder": "US",
-                "help": "ISO country code.",
-                "span": 6,
-            },
-        ],
-    },
-    "linkedin_profiles": {
-        "label": "LinkedIn Profiles",
-        "description": "Search or fetch LinkedIn person profiles for individual prospect research.",
-        "handler": outscraper_tools.linkedin_profiles,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Profile Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "https://www.linkedin.com/in/realvlad or realvlad",
-                "help": "LinkedIn profile URL, username, or a focused search term.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of profiles to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "linkedin_companies": {
-        "label": "LinkedIn Companies",
-        "description": "Search LinkedIn company pages for account research and company discovery.",
-        "handler": outscraper_tools.linkedin_companies,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Company Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "https://www.linkedin.com/company/outscraper or outscraper",
-                "help": "Company URL, company name, or company identifier.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of companies to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "linkedin_posts": {
-        "label": "LinkedIn Posts",
-        "description": "Pull posts from LinkedIn company pages for content and outreach context.",
-        "handler": outscraper_tools.linkedin_posts,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Company Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "https://www.linkedin.com/company/outscraper or outscraper",
-                "help": "Company URL or company identifier.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Post Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of posts to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "tiktok_profiles": {
-        "label": "TikTok Profiles",
-        "description": "Search TikTok profiles for creator, brand, and audience research.",
-        "handler": outscraper_tools.tiktok_profiles,
-        "fields": [
-            {
-                "name": "query",
-                "label": "TikTok Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "relationship coach",
-                "help": "Username or search term.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of profiles to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "twitter_profiles": {
-        "label": "X / Twitter Profiles",
-        "description": "Search X profiles for founder, brand, and media research.",
-        "handler": outscraper_tools.twitter_profiles,
-        "fields": [
-            {
-                "name": "query",
-                "label": "Profile Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "marriage coach",
-                "help": "Username or search term.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of profiles to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "youtube_search": {
-        "label": "YouTube Search",
-        "description": "Search YouTube videos for topics, channels, and outreach research.",
-        "handler": outscraper_tools.youtube_search,
-        "fields": [
-            {
-                "name": "query",
-                "label": "YouTube Query",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "relationship podcast",
-                "help": "Search term for YouTube discovery.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Result Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of videos to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "youtube_videos": {
-        "label": "YouTube Channel Videos",
-        "description": "Pull recent videos from a specific YouTube channel.",
-        "handler": outscraper_tools.youtube_videos,
-        "fields": [
-            {
-                "name": "channel_url",
-                "label": "Channel URL",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "https://www.youtube.com/@channelname",
-                "help": "Channel URL, username, or channel identifier.",
-                "span": 12,
-            },
-            {
-                "name": "limit",
-                "label": "Video Limit",
-                "type": "number",
-                "required": True,
-                "default": 10,
-                "min": 1,
-                "max": 100,
-                "help": "Maximum number of videos to return.",
-                "span": 12,
-            },
-        ],
-    },
-    "youtube_transcripts": {
-        "label": "YouTube Transcript",
-        "description": "Fetch transcript and caption text from a YouTube video.",
-        "handler": outscraper_tools.youtube_transcripts,
-        "fields": [
-            {
-                "name": "video_url",
-                "label": "Video URL",
-                "type": "textarea",
-                "required": True,
-                "rows": 3,
-                "placeholder": "https://www.youtube.com/watch?v=...",
-                "help": "Provide a YouTube video URL or video ID.",
-                "span": 12,
-            },
-        ],
-    },
-}
-
-
-def _marketplace_search_public_config() -> dict[str, dict[str, Any]]:
-    public: dict[str, dict[str, Any]] = {}
-    for search_type, config in MARKETPLACE_SEARCH_TYPES.items():
-        public[search_type] = {
-            "label": config["label"],
-            "description": config["description"],
-            "fields": config["fields"],
-        }
-    return public
-
-
-def _coerce_marketplace_search_params(search_type: str, raw_params: Any) -> dict[str, Any]:
-    config = MARKETPLACE_SEARCH_TYPES.get(search_type)
-    if not config:
-        raise ValueError(f"Unsupported searchType '{search_type}'.")
-    if raw_params is None:
-        raw_params = {}
-    if not isinstance(raw_params, dict):
-        raise ValueError("params must be a JSON object.")
-
-    normalized: dict[str, Any] = {}
-    for field in config["fields"]:
-        name = field["name"]
-        value = raw_params.get(name)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            if "default" in field:
-                value = field["default"]
-        if field.get("required") and (value is None or (isinstance(value, str) and not value.strip())):
-            raise ValueError(f"Missing required field '{name}'.")
-
-        if field["type"] == "number":
-            if value is None or value == "":
-                continue
-            parsed = _coerce_int(value, fallback=None)
-            if parsed is None:
-                raise ValueError(f"Field '{name}' must be a number.")
-            min_value = field.get("min")
-            max_value = field.get("max")
-            if min_value is not None and parsed < int(min_value):
-                raise ValueError(f"Field '{name}' must be >= {min_value}.")
-            if max_value is not None and parsed > int(max_value):
-                raise ValueError(f"Field '{name}' must be <= {max_value}.")
-            normalized[name] = parsed
-            continue
-
-        text = str(value or "").strip()
-        if text:
-            normalized[name] = text
-
-    return normalized
-
-
-def _first_non_empty(*values: Any) -> str:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped:
-                return stripped
-            continue
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return str(value)
-    return ""
-
-
-def _coerce_optional_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        text = str(value).strip()
-        if not text:
-            return None
-        return float(text)
-    except Exception:
-        return None
-
-
-def _extract_domain_from_value(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if "://" not in text:
-        text = f"https://{text}"
-    try:
-        parsed = urlparse(text)
-    except Exception:
-        return ""
-    host = (parsed.netloc or parsed.path or "").strip().lower()
-    if host.startswith("www."):
-        host = host[4:]
-    return host
-
-
-def _normalize_website_value(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if text.startswith("mailto:") or text.startswith("tel:"):
-        return ""
-    if "://" not in text:
-        text = f"https://{text}"
-    try:
-        parsed = urlparse(text)
-    except Exception:
-        return ""
-    host = (parsed.netloc or parsed.path or "").strip().lower()
-    if not host:
-        return ""
-    if host.startswith("www."):
-        host = host[4:]
-    path = parsed.path or ""
-    normalized = urlunparse(("https", host, path.rstrip("/"), "", "", ""))
-    return normalized.rstrip("/")
-
-
-def _normalize_asset_url(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if text.startswith("mailto:") or text.startswith("tel:"):
-        return ""
-    if "://" not in text:
-        text = f"https://{text}"
-    try:
-        parsed = urlparse(text)
-    except Exception:
-        return ""
-    host = (parsed.netloc or parsed.path or "").strip().lower()
-    if not host:
-        return ""
-    if host.startswith("www."):
-        host = host[4:]
-    return urlunparse(("https", host, parsed.path or "", parsed.params or "", parsed.query or "", parsed.fragment or ""))
-
-
-def _extract_primary_email(record: dict[str, Any]) -> str:
-    email = _first_non_empty(record.get("email"), record.get("business_email"))
-    if email:
-        return email.lower()
-
-    email_lists = [
-        record.get("emails"),
-        record.get("email_addresses"),
-        record.get("business_emails"),
-    ]
-    for value in email_lists:
-        if isinstance(value, list):
-            for item in value:
-                found = _first_non_empty(item.get("email") if isinstance(item, dict) else item)
-                if found:
-                    return found.lower()
-    return ""
-
-
-def _extract_primary_phone(record: dict[str, Any]) -> str:
-    phone = _first_non_empty(record.get("phone"), record.get("phone_number"), record.get("business_phone"))
-    if phone:
-        return phone
-
-    phone_lists = [record.get("phones"), record.get("phone_numbers")]
-    for value in phone_lists:
-        if isinstance(value, list):
-            for item in value:
-                found = _first_non_empty(item.get("number") if isinstance(item, dict) else item)
-                if found:
-                    return found
-    return ""
-
-
-def _extract_coordinates(record: dict[str, Any]) -> tuple[float | None, float | None]:
-    candidate_pairs: list[tuple[Any, Any]] = [
-        (record.get("latitude"), record.get("longitude")),
-        (record.get("lat"), record.get("lng")),
-        (record.get("lat"), record.get("lon")),
-        (record.get("y"), record.get("x")),
-    ]
-
-    for container_key in ("coordinates", "coordinate", "gps_coordinates", "location", "geo", "center"):
-        container = record.get(container_key)
-        if isinstance(container, dict):
-            candidate_pairs.extend(
-                [
-                    (container.get("latitude"), container.get("longitude")),
-                    (container.get("lat"), container.get("lng")),
-                    (container.get("lat"), container.get("lon")),
-                    (container.get("y"), container.get("x")),
-                ]
-            )
-
-    for lat_value, lng_value in candidate_pairs:
-        lat = _coerce_optional_float(lat_value)
-        lng = _coerce_optional_float(lng_value)
-        if lat is not None and lng is not None:
-            return lat, lng
-    return None, None
-
-
-def _extract_marketplace_image(record: dict[str, Any]) -> str:
-    image_value = _first_non_empty(
-        record.get("logo"),
-        record.get("logo_url"),
-        record.get("logoUrl"),
-        record.get("image"),
-        record.get("image_url"),
-        record.get("imageUrl"),
-        record.get("photo"),
-        record.get("photo_url"),
-        record.get("photoUrl"),
-        record.get("thumbnail"),
-        record.get("thumbnail_url"),
-        record.get("thumbnailUrl"),
-        record.get("favicon"),
-        record.get("icon"),
-        record.get("profile_image"),
-        record.get("profile_image_url"),
-        record.get("company_logo"),
-        record.get("company_logo_url"),
-    )
-    if image_value:
-        return _normalize_asset_url(image_value)
-
-    for container_key in ("images", "media", "assets", "profile", "company"):
-        container = record.get(container_key)
-        if isinstance(container, dict):
-            nested_value = _first_non_empty(
-                container.get("logo"),
-                container.get("logo_url"),
-                container.get("image"),
-                container.get("image_url"),
-                container.get("photo"),
-                container.get("thumbnail"),
-                container.get("favicon"),
-                container.get("icon"),
-            )
-            if nested_value:
-                return _normalize_asset_url(nested_value)
-        if isinstance(container, list):
-            for item in container:
-                if isinstance(item, dict):
-                    nested_value = _first_non_empty(
-                        item.get("logo"),
-                        item.get("logo_url"),
-                        item.get("image"),
-                        item.get("image_url"),
-                        item.get("photo"),
-                        item.get("thumbnail"),
-                        item.get("url"),
-                    )
-                else:
-                    nested_value = item
-                normalized = _normalize_asset_url(nested_value)
-                if normalized:
-                    return normalized
-    return ""
-
-
-def _looks_like_marketplace_record(record: dict[str, Any]) -> bool:
-    candidate_keys = {
-        "name",
-        "business_name",
-        "title",
-        "company_name",
-        "website",
-        "domain",
-        "address",
-        "formatted_address",
-        "phone",
-        "email",
-        "place_id",
-        "query",
-        "link",
-        "url",
-    }
-    return any(key in record for key in candidate_keys)
-
-
-def _extract_marketplace_records(result: Any, fallback_domain: str = "") -> list[tuple[dict[str, Any], str]]:
-    extracted: list[tuple[dict[str, Any], str]] = []
-
-    if isinstance(result, list):
-        for item in result:
-            extracted.extend(_extract_marketplace_records(item, fallback_domain))
-        return extracted
-
-    if not isinstance(result, dict):
-        return extracted
-
-    if result.get("mode") == "serial_per_domain" and isinstance(result.get("results"), list):
-        for entry in result["results"]:
-            if not isinstance(entry, dict):
-                continue
-            entry_domain = _first_non_empty(entry.get("domain"), fallback_domain)
-            extracted.extend(_extract_marketplace_records(entry.get("result"), entry_domain))
-        return extracted
-
-    for key in ("data", "items", "organic_results", "companies", "places", "contacts", "leads"):
-        nested = result.get(key)
-        if isinstance(nested, list):
-            for item in nested:
-                extracted.extend(_extract_marketplace_records(item, fallback_domain))
-            if extracted:
-                return extracted
-
-    nested_results = result.get("results")
-    if isinstance(nested_results, list):
-        if nested_results and all(isinstance(item, dict) and "result" in item for item in nested_results):
-            for item in nested_results:
-                item_domain = _first_non_empty(item.get("domain"), fallback_domain)
-                extracted.extend(_extract_marketplace_records(item.get("result"), item_domain))
-        else:
-            for item in nested_results:
-                extracted.extend(_extract_marketplace_records(item, fallback_domain))
-        if extracted:
-            return extracted
-
-    if _looks_like_marketplace_record(result):
-        extracted.append((result, fallback_domain))
-    return extracted
-
-
-def _normalize_contact_row(
-    domain_record: dict[str, Any],
-    contact_record: dict[str, Any],
-    *,
-    search_type: str,
-    fallback_domain: str = "",
-) -> dict[str, Any]:
-    merged = dict(domain_record)
-    merged.update(contact_record)
-
-    domain_value = _first_non_empty(
-        domain_record.get("query"),
-        domain_record.get("domain"),
-        domain_record.get("website"),
-        domain_record.get("url"),
-        fallback_domain,
-    )
-    website = _normalize_website_value(
-        _first_non_empty(
-            contact_record.get("website"),
-            domain_record.get("website"),
-            domain_record.get("url"),
-            domain_value,
-        )
-    )
-    website_domain = _extract_domain_from_value(website or domain_value or fallback_domain)
-
-    contact_name = _first_non_empty(
-        contact_record.get("name"),
-        contact_record.get("full_name"),
-        contact_record.get("first_name"),
-        contact_record.get("title"),
-    )
-    title_bits = [
-        _first_non_empty(contact_record.get("job_title"), contact_record.get("position"), contact_record.get("headline")),
-        _first_non_empty(contact_record.get("department"), contact_record.get("seniority")),
-    ]
-    title = " · ".join(bit for bit in title_bits if bit)
-
-    primary_email = _extract_primary_email(contact_record)
-    if not primary_email:
-        primary_email = _extract_primary_email(domain_record)
-
-    primary_phone = _extract_primary_phone(contact_record)
-    if not primary_phone:
-        primary_phone = _extract_primary_phone(domain_record)
-
-    description = _first_non_empty(
-        contact_record.get("description"),
-        contact_record.get("summary"),
-        contact_record.get("bio"),
-        title,
-        domain_record.get("description"),
-    )
-
-    display_name = contact_name or website_domain or _first_non_empty(domain_record.get("query"), "Contact Result")
-    identity_seed = "|".join(
-        [
-            search_type,
-            display_name,
-            primary_email,
-            primary_phone,
-            website_domain,
-            title,
-        ]
-    )
-
-    return {
-        "id": hashlib.sha1(identity_seed.encode("utf-8")).hexdigest()[:16],
-        "searchType": search_type,
-        "name": display_name,
-        "address": _first_non_empty(domain_record.get("address"), domain_record.get("formatted_address"), domain_record.get("full_address")),
-        "city": _first_non_empty(domain_record.get("city"), domain_record.get("town")),
-        "state": _first_non_empty(domain_record.get("state"), domain_record.get("region")),
-        "country": _first_non_empty(domain_record.get("country"), domain_record.get("country_code")),
-        "postalCode": _first_non_empty(domain_record.get("postal_code"), domain_record.get("zip"), domain_record.get("postcode")),
-        "phone": primary_phone,
-        "email": primary_email,
-        "website": website,
-        "websiteDomain": website_domain,
-        "domain": website_domain or fallback_domain,
-        "category": _first_non_empty(contact_record.get("job_title"), contact_record.get("position"), contact_record.get("department"), domain_record.get("category")),
-        "description": description,
-        "sourceUrl": _normalize_website_value(_first_non_empty(contact_record.get("linkedin"), contact_record.get("url"), domain_record.get("source_url"), domain_record.get("url"))),
-        "logoUrl": _extract_marketplace_image(contact_record) or _extract_marketplace_image(domain_record),
-        "rating": None,
-        "reviewCount": None,
-        "latitude": None,
-        "longitude": None,
-        "hasCoordinates": False,
-        "raw": merged,
-    }
-
-
-def _extract_contact_style_records(result: Any, fallback_domain: str = "") -> list[tuple[dict[str, Any], str]]:
-    extracted: list[tuple[dict[str, Any], str]] = []
-
-    if isinstance(result, list):
-        for item in result:
-            extracted.extend(_extract_contact_style_records(item, fallback_domain))
-        return extracted
-
-    if not isinstance(result, dict):
-        return extracted
-
-    if result.get("mode") == "serial_per_domain" and isinstance(result.get("results"), list):
-        for entry in result["results"]:
-            if not isinstance(entry, dict):
-                continue
-            entry_domain = _first_non_empty(entry.get("domain"), fallback_domain)
-            extracted.extend(_extract_contact_style_records(entry.get("result"), entry_domain))
-        return extracted
-
-    for key in ("data", "items", "results"):
-        nested = result.get(key)
-        if isinstance(nested, list):
-            for item in nested:
-                if not isinstance(item, dict):
-                    continue
-                item_domain = _first_non_empty(item.get("domain"), item.get("query"), item.get("website"), fallback_domain)
-                if "contacts" in item or "emails" in item or "phones" in item or item_domain:
-                    extracted.append((item, item_domain or fallback_domain))
-                else:
-                    extracted.extend(_extract_contact_style_records(item, fallback_domain))
-            if extracted:
-                return extracted
-
-    item_domain = _first_non_empty(result.get("domain"), result.get("query"), result.get("website"), fallback_domain)
-    if "contacts" in result or "emails" in result or "phones" in result or item_domain:
-        extracted.append((result, item_domain or fallback_domain))
-    return extracted
-
-
-def _extract_contact_style_marketplace_leads(search_type: str, result: Any) -> list[dict[str, Any]]:
-    seen: dict[str, dict[str, Any]] = {}
-    for domain_record, fallback_domain in _extract_contact_style_records(result):
-        contacts = domain_record.get("contacts")
-        if isinstance(contacts, list) and contacts:
-            for contact in contacts:
-                if not isinstance(contact, dict):
-                    continue
-                lead = _normalize_contact_row(
-                    domain_record,
-                    contact,
-                    search_type=search_type,
-                    fallback_domain=fallback_domain,
-                )
-                seen.setdefault(lead["id"], lead)
-            continue
-
-        generic_emails = domain_record.get("emails") if isinstance(domain_record.get("emails"), list) else []
-        generic_phones = domain_record.get("phones") if isinstance(domain_record.get("phones"), list) else []
-        fallback_contact = {
-            "name": _first_non_empty(domain_record.get("query"), domain_record.get("domain")),
-            "email": generic_emails[0] if generic_emails else "",
-            "phone": generic_phones[0] if generic_phones else "",
-            "emails": generic_emails,
-            "phones": generic_phones,
-        }
-        lead = _normalize_contact_row(
-            domain_record,
-            fallback_contact,
-            search_type=search_type,
-            fallback_domain=fallback_domain,
-        )
-        seen.setdefault(lead["id"], lead)
-    return list(seen.values())
-
-
-def _normalize_marketplace_lead(
-    record: dict[str, Any],
-    *,
-    search_type: str,
-    fallback_domain: str = "",
-) -> dict[str, Any]:
-    name = _first_non_empty(
-        record.get("name"),
-        record.get("business_name"),
-        record.get("title"),
-        record.get("company_name"),
-        record.get("company"),
-    )
-    website = _normalize_website_value(
-        _first_non_empty(record.get("website"), record.get("site"), record.get("url"), record.get("link"), record.get("domain"), fallback_domain)
-    )
-    website_domain = _extract_domain_from_value(website or fallback_domain or record.get("domain"))
-    email = _extract_primary_email(record)
-    phone = _extract_primary_phone(record)
-    latitude, longitude = _extract_coordinates(record)
-    address = _first_non_empty(
-        record.get("address"),
-        record.get("formatted_address"),
-        record.get("full_address"),
-        record.get("street"),
-    )
-    city = _first_non_empty(record.get("city"), record.get("town"))
-    state = _first_non_empty(record.get("state"), record.get("region"))
-    country = _first_non_empty(record.get("country"), record.get("country_code"))
-    postal_code = _first_non_empty(record.get("postal_code"), record.get("zip"), record.get("postcode"))
-    category = _first_non_empty(record.get("category"), record.get("type"), record.get("primary_category"))
-    description = _first_non_empty(record.get("description"), record.get("snippet"), record.get("about"))
-    source_url = _normalize_website_value(_first_non_empty(record.get("source_url"), record.get("link"), record.get("url")))
-    logo_url = _extract_marketplace_image(record)
-    rating = _coerce_optional_float(record.get("rating"))
-    review_count = _coerce_optional_float(
-        _first_non_empty(record.get("reviews"), record.get("reviews_count"), record.get("review_count"))
-    )
-
-    display_name = name or website_domain or _first_non_empty(record.get("query"), source_url, "Lead Result")
-    identity_seed = "|".join(
-        [
-            search_type,
-            display_name,
-            address,
-            website_domain,
-            f"{latitude or ''}",
-            f"{longitude or ''}",
-        ]
-    )
-
-    return {
-        "id": hashlib.sha1(identity_seed.encode("utf-8")).hexdigest()[:16],
-        "searchType": search_type,
-        "name": display_name,
-        "address": address,
-        "city": city,
-        "state": state,
-        "country": country,
-        "postalCode": postal_code,
-        "phone": phone,
-        "email": email,
-        "website": website,
-        "websiteDomain": website_domain,
-        "domain": website_domain or fallback_domain,
-        "category": category,
-        "description": description,
-        "sourceUrl": source_url,
-        "logoUrl": logo_url,
-        "rating": rating,
-        "reviewCount": int(review_count) if review_count is not None else None,
-        "latitude": latitude,
-        "longitude": longitude,
-        "hasCoordinates": latitude is not None and longitude is not None,
-        "raw": record,
-    }
-
-
-def _extract_marketplace_leads(search_type: str, result: Any) -> list[dict[str, Any]]:
-    if search_type == "emails_and_contacts":
-        return _extract_contact_style_marketplace_leads(search_type, result)
-    seen: dict[str, dict[str, Any]] = {}
-    for record, fallback_domain in _extract_marketplace_records(result):
-        lead = _normalize_marketplace_lead(record, search_type=search_type, fallback_domain=fallback_domain)
-        if lead["id"] not in seen:
-            seen[lead["id"]] = lead
-    return list(seen.values())
-
-
-def _marketplace_map_center(leads: list[dict[str, Any]]) -> dict[str, float] | None:
-    geo_leads = [lead for lead in leads if lead.get("hasCoordinates")]
-    if not geo_leads:
-        return None
-    latitudes = [float(lead["latitude"]) for lead in geo_leads if lead.get("latitude") is not None]
-    longitudes = [float(lead["longitude"]) for lead in geo_leads if lead.get("longitude") is not None]
-    if not latitudes or not longitudes:
-        return None
-    return {
-        "latitude": sum(latitudes) / len(latitudes),
-        "longitude": sum(longitudes) / len(longitudes),
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _sign_oauth_state(payload: dict[str, Any]) -> str:
@@ -2080,6 +1055,70 @@ def _verify_oauth_state(state: str) -> dict[str, Any]:
     return payload
 
 
+def _installation_cookie_name() -> str:
+    return os.getenv(
+        "LEADSMCP_INSTALLATION_COOKIE",
+        "leadsmcp_installation",
+    ).strip() or "leadsmcp_installation"
+
+
+def _sign_installation_cookie(install_key: str) -> str:
+    payload = {
+        "install_key": install_key,
+        "exp": int(time.time()) + 30 * 24 * 60 * 60,
+    }
+    body = json.dumps(
+        payload,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(body).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        _state_secret().encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _verify_installation_cookie(value: str) -> dict[str, Any]:
+    encoded, separator, supplied = value.partition(".")
+    if not separator:
+        raise ValueError("Malformed installation cookie.")
+    expected = hmac.new(
+        _state_secret().encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        raise ValueError("Installation cookie signature mismatch.")
+    padded = encoded + "=" * (-len(encoded) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    if int(payload.get("exp") or 0) < int(time.time()):
+        raise ValueError("Installation cookie expired.")
+    if not payload.get("install_key"):
+        raise ValueError("Installation cookie is missing install_key.")
+    return payload
+
+
+def _attach_installation_cookie(
+    response: Response,
+    install_key: str,
+) -> Response:
+    if install_key:
+        response.set_cookie(
+            _installation_cookie_name(),
+            _sign_installation_cookie(install_key),
+            max_age=30 * 24 * 60 * 60,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
+
 def _oauth_redirect_uri(request: Request) -> str:
     configured = os.getenv("GHL_OAUTH_REDIRECT_URI", "").strip()
     if configured:
@@ -2088,7 +1127,7 @@ def _oauth_redirect_uri(request: Request) -> str:
 
 
 def _oauth_user_type(fallback: str = "") -> str:
-    return fallback.strip() or os.getenv("GHL_OAUTH_USER_TYPE", "Location").strip() or "Location"
+    return fallback.strip() or os.getenv("GHL_OAUTH_USER_TYPE", "").strip()
 
 
 def _ghl_token_endpoint() -> str:
@@ -2106,9 +1145,10 @@ async def _exchange_ghl_authorization_code(
         "client_secret": _required_env("GHL_CLIENT_SECRET"),
         "grant_type": "authorization_code",
         "code": code,
-        "user_type": user_type,
         "redirect_uri": redirect_uri,
     }
+    if user_type:
+        form["user_type"] = user_type
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             _ghl_token_endpoint(),
@@ -2139,9 +1179,10 @@ async def _refresh_ghl_access_token(
         "client_secret": _required_env("GHL_CLIENT_SECRET"),
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "user_type": user_type,
         "redirect_uri": redirect_uri,
     }
+    if user_type:
+        form["user_type"] = user_type
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             _ghl_token_endpoint(),
@@ -2215,18 +1256,13 @@ OUTSCRAPER tools (namespace: outscraper_):
   - outscraper_get_request_results    → Poll a pending async Outscraper request
 
 GHL v2 tools (namespace: ghl_):
-  - ghl_contacts_create_contact → PREFERRED for creating a contact (deterministic REST POST /contacts/)
-  - ghl_contacts_upsert_contact → PREFERRED for create-or-update by email/phone (REST POST /contacts/upsert)
   - ghl_search             → Search CRM records across the connected location
   - ghl_fetch              → Fetch complete records by ID
   - ghl_search_operations  → Discover any permitted HighLevel API operation by intent
   - ghl_describe_operation → Retrieve the required schema for an operation
-  - ghl_execute_operation  → Execute any OTHER discovered operation using the described schema
+  - ghl_execute_operation  → Execute a discovered operation using the described schema
   - The v2 operation catalog covers all domains granted by the connected OAuth/PIT scopes.
   - GHL tools use per-request tenant credentials and remain restricted to one location.
-  - For contact creation, use ghl_contacts_create_contact / ghl_contacts_upsert_contact,
-    NOT ghl_execute_operation. There is no dry-run/preview mode anywhere; never send a
-    dry_run flag. Confirm intent with the user before the single real write.
 
 Stripe tools (namespace: stripe_):
   - stripe_ensure_customer_profile               → Create/update customer before showing full lead details
@@ -2262,12 +1298,36 @@ Field mapping: name->firstName+lastName, phone->phone, site->website,
 full_address->address1, city->city, state->state, postal_code->postalCode
 Always tag contacts with 'outscraper' plus the search category/city.
 Never export to GHL without recording stripe usage for that export batch ID.
+
+TempMail tools (namespace: tempmail_):
+  - tempmail_list_domains               → Available disposable domains for the account tier
+  - tempmail_create_mailbox             → Create one temporary inbox
+  - tempmail_create_campaign_mailboxes  → Bulk-create numbered inboxes for a campaign
+  - tempmail_list_mailboxes             → List existing inboxes and their IDs
+  - tempmail_delete_mailbox             → Tear down an inbox
+  - tempmail_list_mails                 → List messages in an inbox
+  - tempmail_read_mail                  → Read one message in full
+  - tempmail_delete_mail                → Delete one message
+  - tempmail_wait_for_mail              → Poll an inbox until a matching message arrives
+  - tempmail_extract_verification_code  → Pull OTP codes / confirmation links from a message
+
+TempMail usage:
+  - Always call tempmail_list_domains before tempmail_create_mailbox; 'domain' must
+    be one of the returned values.
+  - lifespan must be 0, 300, 600, 900, 1200, or 1800 seconds (0 = no auto-expiry).
+  - Requires TWO credentials: the RapidAPI key and a separate TempMail.so account
+    bearer token. Per-tenant callers send 'x-tempmail-rapidapi-key' and
+    'x-tempmail-token' headers; otherwise server env defaults are used.
+  - Use disposable inboxes for tool signups, deliverability seed tests, and burner
+    reply addresses only. Never present a temp inbox as a prospect's real contact
+    address, and never write one into a GHL contact record.
 """,
 )
 
 # ── Mount local Outscraper sub-server ──────────────────────────────────────────
 orchestrator.mount(outscraper_mcp, namespace="outscraper")
 orchestrator.mount(stripe_mcp, namespace="stripe")
+orchestrator.mount(tempmail_mcp, namespace="tempmail")
 
 # ── Proxy the GHL native MCP (remote HTTP) ────────────────────────────────────
 DEFAULT_GHL_TOKEN = os.getenv("GHL_PIT_TOKEN", "").strip()
@@ -2293,47 +1353,133 @@ ghl_backend = Client(ghl_transport)
 ghl_proxy = create_proxy(ghl_backend, name="GHL Proxy")
 orchestrator.mount(ghl_proxy, namespace="ghl")
 
-# HighLevel v2 exposes a compact five-tool catalog that discovers hundreds of operations.
-# Expose the complete v2 surface by default. The legacy lead/contact allowlist remains
-# available as an opt-in compatibility mode for constrained deployments.
-if os.getenv("GHL_V2_TOOL_ALLOWLIST_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+# The public endpoint fails closed to the approved nine-tool Marketplace contract.
+# A controlled developer deployment can opt into the underlying catalog explicitly.
+LEADSMCP_MODE = load_marketplace_mode()
+orchestrator.add_middleware(MarketplaceToolCatalogMiddleware(mode=LEADSMCP_MODE))
+
+# Retain the legacy GHL group allowlist only for developer-mode compatibility.
+if (
+    LEADSMCP_MODE == DEVELOPER_MODE
+    and os.getenv("GHL_V2_TOOL_ALLOWLIST_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+):
     orchestrator.add_middleware(GHLToolAllowlistMiddleware())
 
-# ── Deterministic GHL contact creation (direct REST, bypasses v2 execute_operation) ──
+
+# ── Deterministic GHL contact writes ─────────────────────────────────────────
 GHL_REST_BASE_URL = os.getenv(
-    "GHL_API_BASE_URL", "https://services.leadconnectorhq.com"
+    "GHL_API_BASE_URL",
+    "https://services.leadconnectorhq.com",
 ).strip().rstrip("/")
 
 
 def _resolve_ghl_rest_credentials() -> tuple[str, str, str]:
-    """Resolve (authorization, location_id, version) for a direct REST call.
-
-    Per-request tenant headers take precedence over the static env defaults, reusing the
-    same precedence/normalisation as the proxied transport ([[build-ghl-tenant-headers]]).
-    """
     incoming = get_http_headers(include=set(GHL_TENANT_HEADER_NAMES))
     tenant = build_ghl_tenant_headers(incoming)
-
-    authorization = (tenant.get("authorization") or default_ghl_headers.get("authorization", "")).strip()
-    location_id = (tenant.get("locationid") or DEFAULT_GHL_LOCATION).strip()
-    version = (tenant.get("version") or DEFAULT_GHL_VERSION or "2021-07-28").strip()
+    authorization = (
+        tenant.get("authorization")
+        or default_ghl_headers.get("authorization", "")
+    ).strip()
+    location_id = (
+        tenant.get("locationid") or DEFAULT_GHL_LOCATION
+    ).strip()
+    version = (
+        tenant.get("version")
+        or DEFAULT_GHL_VERSION
+        or "2021-07-28"
+    ).strip()
     return authorization, location_id, version
+
+
+async def _post_create_contact(
+    url: str,
+    *,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    http_client: httpx.AsyncClient | None = None,
+) -> tuple[int, Any]:
+    async def send(client: httpx.AsyncClient) -> tuple[int, Any]:
+        response = await client.post(url, json=body, headers=headers)
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = {"raw": response.text}
+        return response.status_code, payload
+
+    if http_client is not None:
+        return await send(http_client)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await send(client)
+
+
+async def _deterministic_contact_write(
+    *,
+    endpoint: str,
+    fields: dict[str, Any],
+    tags: list[str] | str | None,
+    custom_fields: list[dict[str, Any]] | dict[str, Any] | None,
+    additional_fields: dict[str, Any] | None,
+    location_id: str | None,
+) -> dict[str, Any]:
+    authorization, resolved_location, version = (
+        _resolve_ghl_rest_credentials()
+    )
+    if not authorization:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "auth_error",
+                    "No CRM authorization token is available.",
+                ).to_dict()
+            )
+        )
+    try:
+        body = build_create_contact_body(
+            location_id=location_id or resolved_location,
+            fields=fields,
+            tags=tags,
+            custom_fields=custom_fields,
+            additional_fields=additional_fields,
+        )
+    except ContactCreateError as exc:
+        raise ToolError(json.dumps(exc.to_dict())) from exc
+
+    try:
+        status_code, payload = await _post_create_contact(
+            f"{GHL_REST_BASE_URL}{endpoint}",
+            headers={
+                "Authorization": authorization,
+                "Version": version,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            body=body,
+        )
+    except httpx.HTTPError as exc:
+        raise ToolError(
+            json.dumps(
+                ContactCreateError(
+                    "transport_error",
+                    f"CRM API request failed: {type(exc).__name__}.",
+                ).to_dict()
+            )
+        ) from exc
+    try:
+        result = map_create_contact_response(status_code, payload)
+    except ContactCreateError as exc:
+        raise ToolError(json.dumps(exc.to_dict())) from exc
+    if endpoint.endswith("/upsert") and isinstance(payload, dict):
+        if payload.get("new") is False:
+            result["status"] = "updated"
+    return result
 
 
 @orchestrator.tool(
     name="ghl_contacts_create_contact",
     description=(
-        "Deterministically create a HighLevel contact via the official REST endpoint "
-        "POST /contacts/. PREFER THIS over ghl_execute_operation for contact creation: "
-        "it has a fixed schema, injects the tenant locationId, and returns structured, "
-        "actionable errors. Provide at least one identifier (email or phone). Supported "
-        "fields: firstName, lastName, name, companyName, email, phone, address1, city, "
-        "state, postalCode, country, website, timezone, tags, source, customFields, and "
-        "additionalFields (pass-through for other GHL-accepted keys). locationId is taken "
-        "from the argument, the x-ghl-location-id request header, or GHL_LOCATION_ID. "
-        "There is NO dry-run/preview/validateOnly mode — HighLevel does not support one, "
-        "so this tool performs the real write immediately. Do not send a dry_run flag; "
-        "confirm intent with the user before calling instead."
+        "Deterministically create a CRM contact through POST /contacts/. "
+        "This performs a real write; confirm user intent before calling."
     ),
 )
 async def ghl_contacts_create_contact(
@@ -2356,108 +1502,36 @@ async def ghl_contacts_create_contact(
     additionalFields: dict[str, Any] | None = None,
     locationId: str | None = None,
 ) -> dict[str, Any]:
-    authorization, resolved_location, version = _resolve_ghl_rest_credentials()
-
-    if not authorization:
-        raise ToolError(
-            json.dumps(
-                ContactCreateError(
-                    "auth_error",
-                    "No HighLevel Authorization token available. Provide x-ghl-token per "
-                    "request or set GHL_PIT_TOKEN.",
-                ).to_dict()
-            )
-        )
-
-    fields = {
-        "firstName": firstName,
-        "lastName": lastName,
-        "name": name,
-        "companyName": companyName,
-        "email": email,
-        "phone": phone,
-        "address1": address1,
-        "city": city,
-        "state": state,
-        "postalCode": postalCode,
-        "country": country,
-        "website": website,
-        "timezone": timezone,
-        "source": source,
-    }
-
-    try:
-        body = build_create_contact_body(
-            location_id=locationId or resolved_location,
-            fields=fields,
-            tags=tags,
-            custom_fields=customFields,
-            additional_fields=additionalFields,
-        )
-    except ContactCreateError as err:
-        raise ToolError(json.dumps(err.to_dict())) from err
-
-    headers = {
-        "Authorization": authorization,
-        "Version": version,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        status_code, payload = await _post_create_contact(
-            f"{GHL_REST_BASE_URL}/contacts/", headers=headers, body=body
-        )
-    except httpx.HTTPError as err:
-        raise ToolError(
-            json.dumps(
-                ContactCreateError(
-                    "transport_error",
-                    f"Failed to reach HighLevel REST API: {type(err).__name__}.",
-                ).to_dict()
-            )
-        ) from err
-
-    try:
-        return map_create_contact_response(status_code, payload)
-    except ContactCreateError as err:
-        raise ToolError(json.dumps(err.to_dict())) from err
-
-
-async def _post_create_contact(
-    url: str,
-    *,
-    headers: dict[str, str],
-    body: dict[str, Any],
-    http_client: httpx.AsyncClient | None = None,
-) -> tuple[int, Any]:
-    """POST the contact body and return (status_code, parsed_json_or_text).
-
-    ``http_client`` may be injected (tests use httpx.MockTransport); otherwise a
-    short-lived client is created per call.
-    """
-    async def _send(client: httpx.AsyncClient) -> tuple[int, Any]:
-        response = await client.post(url, json=body, headers=headers)
-        try:
-            parsed: Any = response.json()
-        except ValueError:
-            parsed = {"raw": response.text}
-        return response.status_code, parsed
-
-    if http_client is not None:
-        return await _send(http_client)
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        return await _send(client)
+    return await _deterministic_contact_write(
+        endpoint="/contacts/",
+        fields={
+            "firstName": firstName,
+            "lastName": lastName,
+            "name": name,
+            "companyName": companyName,
+            "email": email,
+            "phone": phone,
+            "address1": address1,
+            "city": city,
+            "state": state,
+            "postalCode": postalCode,
+            "country": country,
+            "website": website,
+            "timezone": timezone,
+            "source": source,
+        },
+        tags=tags,
+        custom_fields=customFields,
+        additional_fields=additionalFields,
+        location_id=locationId,
+    )
 
 
 @orchestrator.tool(
     name="ghl_contacts_upsert_contact",
     description=(
-        "Deterministically create-or-update a HighLevel contact via the official REST "
-        "endpoint POST /contacts/upsert. Same fixed schema and locationId handling as "
-        "ghl_contacts_create_contact, but matches on email/phone and updates in place "
-        "instead of returning a 409 duplicate. PREFER THIS over ghl_execute_operation "
-        "when a lead may already exist. No dry-run/preview mode exists; the write is real."
+        "Deterministically create or update a CRM contact through "
+        "POST /contacts/upsert. This performs a real write."
     ),
 )
 async def ghl_contacts_upsert_contact(
@@ -2480,77 +1554,29 @@ async def ghl_contacts_upsert_contact(
     additionalFields: dict[str, Any] | None = None,
     locationId: str | None = None,
 ) -> dict[str, Any]:
-    authorization, resolved_location, version = _resolve_ghl_rest_credentials()
-
-    if not authorization:
-        raise ToolError(
-            json.dumps(
-                ContactCreateError(
-                    "auth_error",
-                    "No HighLevel Authorization token available. Provide x-ghl-token per "
-                    "request or set GHL_PIT_TOKEN.",
-                ).to_dict()
-            )
-        )
-
-    fields = {
-        "firstName": firstName,
-        "lastName": lastName,
-        "name": name,
-        "companyName": companyName,
-        "email": email,
-        "phone": phone,
-        "address1": address1,
-        "city": city,
-        "state": state,
-        "postalCode": postalCode,
-        "country": country,
-        "website": website,
-        "timezone": timezone,
-        "source": source,
-    }
-
-    try:
-        body = build_create_contact_body(
-            location_id=locationId or resolved_location,
-            fields=fields,
-            tags=tags,
-            custom_fields=customFields,
-            additional_fields=additionalFields,
-        )
-    except ContactCreateError as err:
-        raise ToolError(json.dumps(err.to_dict())) from err
-
-    headers = {
-        "Authorization": authorization,
-        "Version": version,
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-
-    try:
-        status_code, payload = await _post_create_contact(
-            f"{GHL_REST_BASE_URL}/contacts/upsert", headers=headers, body=body
-        )
-    except httpx.HTTPError as err:
-        raise ToolError(
-            json.dumps(
-                ContactCreateError(
-                    "transport_error",
-                    f"Failed to reach HighLevel REST API: {type(err).__name__}.",
-                ).to_dict()
-            )
-        ) from err
-
-    try:
-        result = map_create_contact_response(status_code, payload)
-    except ContactCreateError as err:
-        raise ToolError(json.dumps(err.to_dict())) from err
-
-    # Upsert reports whether the record was new; reflect update vs create in the status.
-    if isinstance(payload, dict) and payload.get("new") is False:
-        result["status"] = "updated"
-    return result
+    return await _deterministic_contact_write(
+        endpoint="/contacts/upsert",
+        fields={
+            "firstName": firstName,
+            "lastName": lastName,
+            "name": name,
+            "companyName": companyName,
+            "email": email,
+            "phone": phone,
+            "address1": address1,
+            "city": city,
+            "state": state,
+            "postalCode": postalCode,
+            "country": country,
+            "website": website,
+            "timezone": timezone,
+            "source": source,
+        },
+        tags=tags,
+        custom_fields=customFields,
+        additional_fields=additionalFields,
+        location_id=locationId,
+    )
 
 # ── OAuth routes (GoHighLevel Marketplace install flow) ──────────────────────
 @orchestrator.custom_route("/oauth/ghl/start", methods=["GET"])
@@ -2633,6 +1659,12 @@ async def ghl_oauth_callback(request: Request):
             {"error": "token_exchange_failed", "message": str(exc)},
             status_code=502,
         )
+    user_type = str(
+        token_payload.get("userType")
+        or token_payload.get("user_type")
+        or user_type
+        or "Location"
+    )
 
     result = _oauth_result_payload(
         token_payload,
@@ -2643,7 +1675,7 @@ async def ghl_oauth_callback(request: Request):
 
     store_status: dict[str, Any]
     try:
-        store_status = _persist_ghl_install_record(
+        store_status = await _persist_ghl_install_record(
             token_payload=token_payload,
             redirect_uri=redirect_uri,
             user_type=user_type,
@@ -2651,8 +1683,29 @@ async def ghl_oauth_callback(request: Request):
             source="oauth_callback",
         )
     except Exception as exc:
+        if LEADSMCP_MODE != DEVELOPER_MODE:
+            return JSONResponse(
+                {
+                    "error": "install_storage_unavailable",
+                    "message": str(exc),
+                },
+                status_code=503,
+            )
         store_status = {"stored": False, "error": str(exc)}
 
+    try:
+        bulk_status = await _provision_bulk_locations(
+            token_payload=token_payload,
+            redirect_uri=redirect_uri,
+        )
+    except Exception as exc:
+        bulk_status = {
+            "attempted": True,
+            "provisioned": 0,
+            "errors": [str(exc)],
+        }
+
+    install_key = str(store_status.get("install_key") or "")
     success_redirect = os.getenv("GHL_OAUTH_SUCCESS_REDIRECT_URL", "").strip()
     if success_redirect:
         redirect_params = {
@@ -2662,11 +1715,18 @@ async def ghl_oauth_callback(request: Request):
             "user_type": str(user_type),
             "tokens_hidden": "true",
             "install_stored": "true" if store_status.get("stored") else "false",
+            "locations_provisioned": str(
+                bulk_status.get("provisioned") or 0
+            ),
         }
-        return RedirectResponse(url=_append_query_params(success_redirect, redirect_params), status_code=303)
+        response = RedirectResponse(
+            url=_append_query_params(success_redirect, redirect_params),
+            status_code=303,
+        )
+        return _attach_installation_cookie(response, install_key)
 
     if not _allow_callback_token_response():
-        return JSONResponse(
+        response = JSONResponse(
             {
                 "ok": True,
                 "status": "connected",
@@ -2676,11 +1736,14 @@ async def ghl_oauth_callback(request: Request):
                 "location_id": str(result.get("location_id") or ""),
                 "tokens_hidden": True,
                 "install_stored": bool(store_status.get("stored")),
+                "bulk_provisioning": bulk_status,
             }
         )
+        return _attach_installation_cookie(response, install_key)
 
     result["install_store"] = store_status
-    return JSONResponse(result)
+    result["bulk_provisioning"] = bulk_status
+    return _attach_installation_cookie(JSONResponse(result), install_key)
 
 
 @orchestrator.custom_route("/leadsmcp/install", methods=["GET"])
@@ -2731,13 +1794,19 @@ async def ghl_oauth_exchange(request: Request):
             {"error": "token_exchange_failed", "message": str(exc)},
             status_code=502,
         )
+    user_type = str(
+        token_payload.get("userType")
+        or token_payload.get("user_type")
+        or user_type
+        or "Location"
+    )
     result = _oauth_result_payload(
         token_payload,
         redirect_uri=redirect_uri,
         user_type=user_type,
     )
     try:
-        result["install_store"] = _persist_ghl_install_record(
+        result["install_store"] = await _persist_ghl_install_record(
             token_payload=token_payload,
             redirect_uri=redirect_uri,
             user_type=user_type,
@@ -2745,6 +1814,11 @@ async def ghl_oauth_exchange(request: Request):
             source="oauth_exchange",
         )
     except Exception as exc:
+        if LEADSMCP_MODE != DEVELOPER_MODE:
+            return JSONResponse(
+                {"error": "install_storage_unavailable", "message": str(exc)},
+                status_code=503,
+            )
         result["install_store"] = {"stored": False, "error": str(exc)}
     return JSONResponse(result)
 
@@ -2778,13 +1852,19 @@ async def ghl_oauth_refresh(request: Request):
             {"error": "token_refresh_failed", "message": str(exc)},
             status_code=502,
         )
+    user_type = str(
+        token_payload.get("userType")
+        or token_payload.get("user_type")
+        or user_type
+        or "Location"
+    )
     result = _oauth_result_payload(
         token_payload,
         redirect_uri=redirect_uri,
         user_type=user_type,
     )
     try:
-        result["install_store"] = _persist_ghl_install_record(
+        result["install_store"] = await _persist_ghl_install_record(
             token_payload=token_payload,
             redirect_uri=redirect_uri,
             user_type=user_type,
@@ -2792,8 +1872,270 @@ async def ghl_oauth_refresh(request: Request):
             source="oauth_refresh",
         )
     except Exception as exc:
+        if LEADSMCP_MODE != DEVELOPER_MODE:
+            return JSONResponse(
+                {"error": "install_storage_unavailable", "message": str(exc)},
+                status_code=503,
+            )
         result["install_store"] = {"stored": False, "error": str(exc)}
     return JSONResponse(result)
+
+
+async def _agency_installation_for_event(
+    company_id: str,
+) -> dict[str, Any] | None:
+    candidates = await list_installations(company_id=company_id)
+    agency = next(
+        (
+            record
+            for record in candidates
+            if str(record.get("user_type") or "").lower() == "company"
+            and not str(record.get("location_id") or "").strip()
+        ),
+        None,
+    )
+    if agency:
+        return agency
+    if company_id:
+        return None
+    all_active = await list_installations()
+    future_agencies = [
+        record
+        for record in all_active
+        if str(record.get("user_type") or "").lower() == "company"
+        and record.get("install_to_future_locations") is True
+    ]
+    return future_agencies[0] if len(future_agencies) == 1 else None
+
+
+@orchestrator.custom_route("/webhooks/ghl", methods=["POST"])
+async def ghl_marketplace_webhook(request: Request) -> JSONResponse:
+    raw_body = await request.body()
+    signature = request.headers.get("x-ghl-signature", "").strip()
+    if not verify_ghl_signature(raw_body, signature):
+        return JSONResponse({"error": "invalid_signature"}, status_code=401)
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid_payload"}, status_code=400)
+
+    expected_app_id = os.getenv("GHL_APP_ID", "").strip()
+    app_id = str(payload.get("appId") or "").strip()
+    if expected_app_id and not hmac.compare_digest(app_id, expected_app_id):
+        return JSONResponse({"error": "invalid_app"}, status_code=403)
+
+    event_id = webhook_event_id(payload, raw_body)
+    existing_event = await get_webhook_event(event_id)
+    if existing_event and existing_event.get("status") == "processed":
+        return JSONResponse({"ok": True, "duplicate": True})
+
+    event_type = str(payload.get("type") or "").strip().upper()
+    company_id = str(payload.get("companyId") or "").strip()
+    location_id = str(payload.get("locationId") or "").strip()
+    status = "processed"
+    processing_error = ""
+    details: dict[str, Any] = {}
+    try:
+        if event_type == "INSTALL":
+            if location_id:
+                installation = await get_installation(
+                    location_id=location_id,
+                )
+                if installation:
+                    await patch_installations(
+                        location_id=location_id,
+                        values={
+                            "installed": True,
+                            "app_id": app_id or installation.get("app_id"),
+                            "plan_id": str(payload.get("planId") or ""),
+                            "trial": payload.get("trial"),
+                            "webhook_id": event_id,
+                            "uninstalled_at": None,
+                        },
+                    )
+                    details["location_status"] = "updated"
+                else:
+                    agency = await _agency_installation_for_event(company_id)
+                    if not agency:
+                        raise RuntimeError(
+                            "No agency installation is available for location-token exchange."
+                        )
+                    agency_token = _decrypt_from_store(
+                        str(agency.get("access_token_encrypted") or "")
+                    )
+                    location_token = await exchange_location_token(
+                        agency_access_token=agency_token,
+                        company_id=str(agency.get("company_id") or company_id),
+                        location_id=location_id,
+                    )
+                    location_token["appId"] = app_id
+                    location_token["planId"] = payload.get("planId")
+                    location_token["trial"] = payload.get("trial")
+                    await _persist_ghl_install_record(
+                        token_payload=location_token,
+                        redirect_uri=str(agency.get("redirect_uri") or ""),
+                        user_type="Location",
+                        state_payload=None,
+                        source="app_install_webhook",
+                    )
+                    details["location_status"] = "provisioned"
+            else:
+                details["agency_status"] = "awaiting_oauth_callback"
+        elif event_type == "UNINSTALL":
+            removed = await mark_uninstalled(
+                company_id=company_id,
+                location_id=location_id,
+            )
+            details["installations_disabled"] = removed
+        elif event_type == "APP_PAYMENT_STATUS":
+            updated = await patch_installations(
+                company_id=company_id,
+                location_id=location_id,
+                values={
+                    "payment_status": str(
+                        payload.get("newStatus") or "PENDING"
+                    ),
+                    "webhook_id": event_id,
+                },
+            )
+            details["installations_updated"] = updated
+        else:
+            details["ignored"] = True
+    except Exception as exc:
+        status = "pending"
+        processing_error = str(exc)[:500]
+
+    await record_webhook_event(
+        {
+            "webhook_id": event_id,
+            "event_type": event_type or "UNKNOWN",
+            "app_id": app_id or None,
+            "company_id": company_id or None,
+            "location_id": location_id or None,
+            "status": status,
+            "error": processing_error or None,
+            "payload": payload,
+        }
+    )
+    return JSONResponse(
+        {
+            "ok": status == "processed",
+            "status": status,
+            "details": details,
+        }
+    )
+
+
+@orchestrator.custom_route(
+    "/marketplace/billing/charge",
+    methods=["POST"],
+)
+async def marketplace_wallet_charge(request: Request) -> JSONResponse:
+    installation = getattr(request.state, "ghl_installation", None)
+    if not installation:
+        return JSONResponse(
+            {
+                "error": "installation_required",
+                "message": "A bound Marketplace installation is required.",
+            },
+            status_code=403,
+        )
+    body = await _read_request_body(request)
+    event_id = str(body.get("event_id") or "").strip()
+    description = str(body.get("description") or "").strip()
+    units = _coerce_int(body.get("units"), 0) or 0
+    if not event_id or not description or units <= 0:
+        return JSONResponse(
+            {
+                "error": "invalid_request",
+                "message": "event_id, description, and units > 0 are required.",
+            },
+            status_code=400,
+        )
+    if not os.getenv("GHL_APP_ID", "").strip() or not os.getenv(
+        "GHL_MARKETPLACE_METER_ID", ""
+    ).strip():
+        return JSONResponse(
+            {
+                "error": "marketplace_billing_not_configured",
+                "message": "GHL_APP_ID and GHL_MARKETPLACE_METER_ID are required.",
+            },
+            status_code=503,
+        )
+    existing = await get_wallet_charge(event_id)
+    if existing and existing.get("status") == "complete":
+        return JSONResponse(
+            {
+                "ok": True,
+                "duplicate": True,
+                "charge_id": existing.get("charge_id"),
+            }
+        )
+
+    install_key = str(installation.get("install_key") or "")
+    ledger = {
+        "event_id": event_id,
+        "install_key": install_key,
+        "status": "pending",
+        "units": units,
+        "description": description,
+        "payload": body,
+        "error": None,
+    }
+    await upsert_wallet_charge(ledger)
+    try:
+        result = await create_wallet_charge(
+            access_token=_decrypt_from_store(
+                str(installation.get("access_token_encrypted") or "")
+            ),
+            app_id=str(
+                installation.get("app_id")
+                or os.getenv("GHL_APP_ID", "")
+            ),
+            meter_id=os.getenv("GHL_MARKETPLACE_METER_ID", "").strip(),
+            event_id=event_id,
+            location_id=str(installation.get("location_id") or ""),
+            company_id=str(installation.get("company_id") or ""),
+            user_id=str(installation.get("user_id") or ""),
+            description=description,
+            units=units,
+            price=(
+                float(body["price"])
+                if body.get("price") is not None
+                else None
+            ),
+            event_time=str(body.get("event_time") or ""),
+        )
+    except Exception as exc:
+        await upsert_wallet_charge(
+            {
+                **ledger,
+                "status": "failed",
+                "error": str(exc)[:500],
+            }
+        )
+        return JSONResponse(
+            {"error": "wallet_charge_failed", "message": str(exc)},
+            status_code=502,
+        )
+    await upsert_wallet_charge(
+        {
+            **ledger,
+            "status": "complete",
+            "charge_id": str(result.get("chargeId") or ""),
+            "error": None,
+        }
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "charge_id": result.get("chargeId"),
+            "event_id": event_id,
+        },
+        status_code=201,
+    )
 
 # ── Public support pages ─────────────────────────────────────────────────────
 @orchestrator.custom_route("/support", methods=["GET"])
@@ -2843,467 +2185,409 @@ async def install_success_page(request: Request) -> HTMLResponse:
     )
 
 
-@orchestrator.custom_route("/app/onboarding", methods=["GET"])
-@orchestrator.custom_route("/app/onboarding/", methods=["GET"])
-async def onboarding_chat_page(request: Request) -> HTMLResponse:
-    html_path = Path(__file__).parent / "pages" / "onboarding-chat.html"
-    return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
-@orchestrator.custom_route("/app/lead-search", methods=["GET"])
-@orchestrator.custom_route("/app/lead-search/", methods=["GET"])
-async def marketplace_lead_search_page(request: Request) -> HTMLResponse:
-    base_url = _public_base_url(request)
-    github_url = os.getenv("LEADSMCP_GITHUB_URL", "https://github.com/dofski/leadsmcp").strip()
-    mapbox_public_token = os.getenv("MAPBOX_PUBLIC_TOKEN", "").strip()
-    mapbox_style_url = os.getenv("MAPBOX_STYLE_URL", "mapbox://styles/mapbox/standard-satellite").strip()
-    mapbox_js_url = "https://api.mapbox.com/mapbox-gl-js/v3.19.1/mapbox-gl.js"
-    mapbox_css_url = "https://api.mapbox.com/mapbox-gl-js/v3.19.1/mapbox-gl.css"
-    search_config_json = json.dumps(_marketplace_search_public_config(), separators=(",", ":")).replace("</", "<\\/")
-    return HTMLResponse(
-        build_marketplace_search_page(
-            base_url=base_url,
-            github_url=github_url,
-            context_endpoint=f"{base_url}/api/marketplace/user-context",
-            search_endpoint=f"{base_url}/api/marketplace/lead-search",
-            ai_endpoint=f"{base_url}/api/marketplace/llm-chat",
-            search_config_json=search_config_json,
-            mapbox_public_token=mapbox_public_token,
-            mapbox_style_url=mapbox_style_url,
-            mapbox_js_url=mapbox_js_url,
-            mapbox_css_url=mapbox_css_url,
-        )
-    )
+# Content-Security-Policy for the GoHighLevel Marketplace onboarding page. The
+# page is embedded in HighLevel's iframe, so it must permit HighLevel origins as
+# frame-ancestors and must NOT emit X-Frame-Options DENY/SAMEORIGIN.
 
 
-@orchestrator.custom_route("/api/marketplace/user-context", methods=["POST"])
-async def marketplace_user_context(request: Request) -> JSONResponse:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Custom Connector OAuth 2.0 / DCR Authorization Server
+# Lets ChatGPT and Perplexity (and any RFC 6749/8414/7591/9728 client) install the
+# /mcp endpoint. Storage is Supabase-backed (see connector_oauth.py). Legacy
+# x-mcp-secret auth continues to work in parallel.
+# ══════════════════════════════════════════════════════════════════════════════
+async def _read_request_body(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            parsed = await request.json()
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
     try:
-        body = await request.json()
+        form = await request.form()
     except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+        return {}
+    return {k: str(v) for k, v in form.items()}
 
-    encrypted_data = str(body.get("encryptedData") or "").strip()
-    if not encrypted_data:
-        return JSONResponse(
-            {"ok": False, "error": "missing_encrypted_data", "message": "Request JSON must include encryptedData."},
-            status_code=400,
-        )
 
-    try:
-        user_context = _decrypt_marketplace_user_context(encrypted_data)
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "context_decrypt_failed", "message": str(exc)},
-            status_code=400,
-        )
+def _connector_store_error(exc: "connector_oauth.StoreError") -> JSONResponse:
+    """Turn a backend StoreError into a structured, non-secret 503 (never a bare 500).
 
+    Surfaces the upstream PostgREST status and short message (e.g. "permission
+    denied for table connector_oauth") so the failure is debuggable without
+    Vercel logs. Contains no credentials or Supabase URL.
+    """
     return JSONResponse(
         {
-            "ok": True,
-            "context": _marketplace_user_context_summary(user_context),
-        }
+            "error": "temporarily_unavailable",
+            "error_description": "The connector store rejected the request.",
+            "store_status": exc.status,
+            "store_detail": exc.detail,
+        },
+        status_code=503,
     )
 
 
-@orchestrator.custom_route("/api/marketplace/llm-chat", methods=["POST"])
-async def marketplace_llm_chat(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+@orchestrator.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def connector_oauth_as_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.authorization_server_metadata(_public_base_url(request)))
 
-    encrypted_data = str(body.get("encryptedData") or "").strip()
-    raw_messages = body.get("messages") or []
-    current_search = body.get("currentSearch") or {}
 
-    if not encrypted_data:
+@orchestrator.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def connector_oauth_pr_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.protected_resource_metadata(_public_base_url(request)))
+
+
+@orchestrator.custom_route("/.well-known/mcp.json", methods=["GET"])
+async def connector_mcp_manifest(request: Request) -> JSONResponse:
+    base = _public_base_url(request).rstrip("/")
+    return JSONResponse({
+        "schema_version": "1.0",
+        "name_for_human": "LeadsMCP",
+        "name_for_model": "leadsmcp",
+        "description_for_human": "Live lead search, Google Maps business data, and GoHighLevel CRM sync in one MCP server.",
+        "description_for_model": "Search for businesses and leads via Outscraper/Google Maps and push contacts and opportunities into GoHighLevel CRM. Requires OAuth authentication.",
+        "auth": {
+            "type": "oauth",
+            "authorization_url": f"{base}/authorize",
+            "token_url": f"{base}/token",
+            "scope": " ".join(connector_oauth.scopes_supported()),
+        },
+        "api": {"type": "mcp", "url": f"{base}/mcp"},
+        "contact_email": os.getenv("LEADSMCP_CONTACT_EMAIL", "") or None,
+        "legal_info_url": f"{base}/support",
+    })
+
+
+@orchestrator.custom_route("/register", methods=["POST"])
+async def connector_oauth_register(request: Request) -> JSONResponse:
+    if not connector_oauth.dcr_enabled():
         return JSONResponse(
-            {"ok": False, "error": "missing_encrypted_data", "message": "Request JSON must include encryptedData."},
+            {"error": "access_denied", "error_description": "Dynamic client registration is disabled."},
+            status_code=403,
+        )
+    body = await _read_request_body(request)
+    try:
+        status, payload = await connector_oauth.register_client(body)
+    except connector_oauth.StoreError as exc:
+        return _connector_store_error(exc)
+    return JSONResponse(payload, status_code=status)
+
+
+@orchestrator.custom_route("/authorize", methods=["GET"])
+@orchestrator.custom_route("/oauth/connector/authorize", methods=["GET"])
+async def connector_oauth_authorize(request: Request) -> Response:
+    q = request.query_params
+    response_type = q.get("response_type", "code").strip()
+    client_id = q.get("client_id", "").strip()
+    redirect_uri = q.get("redirect_uri", "").strip()
+    state = q.get("state", "").strip()
+    scope = q.get("scope", "").strip() or " ".join(connector_oauth.scopes_supported())
+    code_challenge = q.get("code_challenge", "").strip()
+    code_challenge_method = q.get("code_challenge_method", "plain").strip() or "plain"
+
+    if response_type != "code":
+        return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
+
+    try:
+        client = await connector_oauth.resolve_client(client_id)
+    except connector_oauth.StoreError as exc:
+        return _connector_store_error(exc)
+    if not client:
+        return JSONResponse(
+            {"error": "invalid_client", "error_description": f"Unknown client_id: {client_id!r}."},
             status_code=400,
         )
+    if not redirect_uri:
+        return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri is required."}, status_code=400)
+    if not connector_oauth.redirect_uri_registered(client, redirect_uri):
+        return JSONResponse({"error": "invalid_request", "error_description": "redirect_uri not registered for this client."}, status_code=400)
 
-    try:
-        llm_config = _marketplace_llm_config()
-    except ValueError as exc:
-        message = str(exc)
+    installation_binding: dict[str, str] = {}
+    cookie_value = request.cookies.get(_installation_cookie_name(), "")
+    if cookie_value:
+        try:
+            cookie_payload = _verify_installation_cookie(cookie_value)
+            installation = await get_installation(
+                install_key=str(cookie_payload["install_key"])
+            )
+        except (ValueError, KeyError):
+            installation = None
+    else:
+        installation = None
+
+    if LEADSMCP_MODE != DEVELOPER_MODE and not installation:
         return JSONResponse(
             {
-                "ok": False,
-                "error": "missing_llm_api_key",
-                "message": message,
-                "provider": _marketplace_llm_provider(),
+                "error": "installation_required",
+                "error_description": (
+                    "Install LeadsMCP in the CRM before authorizing an AI connector."
+                ),
             },
-            status_code=503,
+            status_code=403,
         )
 
-    try:
-        user_context = _decrypt_marketplace_user_context(encrypted_data)
-        messages = _coerce_marketplace_chat_messages(raw_messages)
-    except ValueError as exc:
-        return JSONResponse(
-            {"ok": False, "error": "invalid_request", "message": str(exc)},
-            status_code=400,
-        )
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "context_decrypt_failed", "message": str(exc)},
-            status_code=400,
-        )
-
-    try:
-        from langchain_openai import ChatOpenAI
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-        from langgraph.prebuilt import create_react_agent
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "llm_dependencies_unavailable", "message": str(exc)},
-            status_code=500,
-        )
-
-    context_summary = _marketplace_user_context_summary(user_context)
-    active_location = context_summary.get("activeLocation") or "unknown"
-    company_id = context_summary.get("companyId") or "unknown"
-
-    current_search_note = ""
-    if isinstance(current_search, dict) and current_search:
-        preview = {
-            "searchType": current_search.get("searchType"),
-            "searchLabel": current_search.get("searchLabel"),
-            "leadCount": current_search.get("leadCount"),
-            "leadPreview": (current_search.get("leadPreview") or [])[:5],
+    if installation:
+        if not str(installation.get("location_id") or "").strip():
+            requested_location = q.get("location_id", "").strip()
+            locations = [
+                record
+                for record in await list_installations(
+                    company_id=str(installation.get("company_id") or "")
+                )
+                if str(record.get("location_id") or "").strip()
+            ]
+            if requested_location:
+                installation = next(
+                    (
+                        record
+                        for record in locations
+                        if str(record.get("location_id") or "")
+                        == requested_location
+                    ),
+                    None,
+                )
+            elif len(locations) == 1:
+                installation = locations[0]
+            else:
+                return JSONResponse(
+                    {
+                        "error": "location_id_required",
+                        "error_description": (
+                            "Choose one authorized CRM business account."
+                        ),
+                        "available_locations": [
+                            str(record.get("location_id") or "")
+                            for record in locations
+                        ],
+                    },
+                    status_code=400,
+                )
+        if not installation:
+            return JSONResponse(
+                {
+                    "error": "invalid_location",
+                    "error_description": "Requested location is not authorized.",
+                },
+                status_code=403,
+            )
+        installation_binding = {
+            "install_key": str(installation.get("install_key") or ""),
+            "company_id": str(installation.get("company_id") or ""),
+            "location_id": str(installation.get("location_id") or ""),
         }
-        current_search_note = f"\nCurrent workspace search context:\n{json.dumps(preview, ensure_ascii=True)}\n"
 
-    system_prompt = f"""
-You are the LeadsMCP AI workspace copilot embedded inside a GoHighLevel custom page.
-
-Rules:
-- You are connected to the same LeadsMCP MCP server backing this page.
-- You may use Outscraper research tools and GoHighLevel tools.
-- You may read from GoHighLevel and write to GoHighLevel when the user clearly asks you to create, update, or organize records.
-- Do not use Stripe billing/export tools from this page.
-- Prefer Outscraper and research tools for discovery, and GHL tools for CRM lookup, create, update, tagging, and organization.
-- If the user asks about the current visible search results, use the provided workspace context first.
-- Be concise, practical, and action-oriented.
-- When you write to GHL, briefly summarize exactly what you changed.
-
-Marketplace session:
-- company_id: {company_id}
-- active_location: {active_location}
-{current_search_note}
-""".strip()
-
-    mcp_url = f"{_public_base_url(request)}/mcp"
+    scopes = [s for s in scope.split() if s]
     try:
-        headers = await _marketplace_llm_headers(user_context)
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "ghl_auth_resolution_failed", "message": str(exc)},
-            status_code=500,
+        code = await connector_oauth.issue_code(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scopes=scopes,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+            installation=installation_binding,
         )
-
-    try:
-        client = MultiServerMCPClient(
-            {
-                "leadsmcp": {
-                    "url": mcp_url,
-                    "transport": "streamable_http",
-                    "headers": headers,
-                }
-            }
-        )
-        tools = await client.get_tools()
-        workspace_tools = [
-            tool for tool in tools
-            if getattr(tool, "name", "").startswith("outscraper_")
-            or getattr(tool, "name", "").startswith("ghl_")
-        ]
-
-        llm_kwargs: dict[str, Any] = {
-            "model": llm_config["model"],
-            "api_key": llm_config["api_key"],
-            "temperature": 1e-8,
-        }
-        if llm_config.get("base_url"):
-            llm_kwargs["base_url"] = llm_config["base_url"]
-
-        llm = ChatOpenAI(**llm_kwargs)
-
-        agent = create_react_agent(llm, workspace_tools, prompt=system_prompt)
-        result = await agent.ainvoke({"messages": messages})
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "llm_run_failed", "message": str(exc)},
-            status_code=500,
-        )
-
-    reply = ""
-    tool_calls: list[str] = []
-    for msg in result.get("messages", []):
-        msg_type = getattr(msg, "type", "")
-        if msg_type == "ai":
-            text = _message_content_text(getattr(msg, "content", ""))
-            if text:
-                reply = text
-            for call in getattr(msg, "tool_calls", []) or []:
-                if isinstance(call, dict) and call.get("name"):
-                    tool_calls.append(str(call["name"]))
-
-    if not reply:
-        reply = "I connected to the research workspace, but I did not generate a final answer. Please try rephrasing the request."
-
-    return JSONResponse(
-        {
-            "ok": True,
-            "reply": reply,
-            "toolCalls": sorted(set(tool_calls)),
-            "model": llm_config["model"],
-            "provider": llm_config["provider"],
-            "context": context_summary,
-        }
-    )
+    except connector_oauth.StoreError as exc:
+        return _connector_store_error(exc)
+    params: dict[str, str] = {"code": code}
+    if state:
+        params["state"] = state
+    return RedirectResponse(url=_append_query_params(redirect_uri, params), status_code=302)
 
 
-@orchestrator.custom_route("/api/onboarding-chat", methods=["POST"])
-async def onboarding_chat_api(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+def _extract_client_credentials(request: Request, body: dict[str, Any]) -> tuple[str, str]:
+    """Resolve client_id / client_secret from Basic auth or POST body."""
+    auth_header = request.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith("basic "):
+        try:
+            decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+            cid, _, csecret = decoded.partition(":")
+            if cid:
+                return cid.strip(), csecret.strip()
+        except Exception:
+            pass
+    return body.get("client_id", "").strip(), body.get("client_secret", "").strip()
 
-    raw_messages = body.get("messages") or []
-    location_id = str(body.get("location_id") or "").strip()
-    location_name = str(body.get("location_name") or "").strip() or "this location"
-    user_name = str(body.get("user_name") or "").strip() or "there"
-    provided_mcp_url = str(body.get("mcp_url") or "").strip()
 
-    if not provided_mcp_url:
-        return JSONResponse(
-            {"ok": False, "error": "missing_mcp_url", "message": "Request JSON must include mcp_url."},
-            status_code=400,
-        )
+@orchestrator.custom_route("/token", methods=["POST"])
+@orchestrator.custom_route("/oauth/connector/token", methods=["POST"])
+async def connector_oauth_token(request: Request) -> JSONResponse:
+    body = await _read_request_body(request)
+    grant_type = body.get("grant_type", "").strip()
+    client_id, client_secret = _extract_client_credentials(request, body)
 
     try:
-        llm_config = _marketplace_llm_config()
-    except ValueError as exc:
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": "missing_llm_api_key",
-                "message": str(exc),
-                "provider": _marketplace_llm_provider(),
-            },
-            status_code=503,
+        return await _connector_oauth_token_grant(request, body, grant_type, client_id, client_secret)
+    except connector_oauth.StoreError as exc:
+        return _connector_store_error(exc)
+
+
+async def _connector_oauth_token_grant(
+    request: Request,
+    body: dict[str, Any],
+    grant_type: str,
+    client_id: str,
+    client_secret: str,
+) -> JSONResponse:
+    client = await connector_oauth.resolve_client(client_id)
+    if not client:
+        return JSONResponse({"error": "invalid_client", "error_description": "Unknown client."}, status_code=401)
+
+    # Confidential clients must present a valid secret; public clients rely on PKCE.
+    is_public = client.get("token_endpoint_auth_method") == "none"
+    if not is_public and not connector_oauth.validate_client_secret(client, client_secret):
+        return JSONResponse({"error": "invalid_client", "error_description": "Invalid client credentials."}, status_code=401)
+
+    if grant_type == "authorization_code":
+        code = body.get("code", "").strip()
+        redirect_uri = body.get("redirect_uri", "").strip()
+        code_verifier = body.get("code_verifier", "").strip()
+        if not code:
+            return JSONResponse({"error": "invalid_request", "error_description": "code is required."}, status_code=400)
+
+        record = await connector_oauth.consume_code(code=code)
+        if not record or record.get("client_id") != client_id:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Code invalid, expired, or already used."}, status_code=400)
+
+        data = record.get("data") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+        if redirect_uri and data.get("redirect_uri") != redirect_uri:
+            return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch."}, status_code=400)
+
+        challenge = data.get("code_challenge", "")
+        if (is_public or challenge) and not connector_oauth.verify_pkce(
+            code_verifier=code_verifier,
+            code_challenge=challenge,
+            method=data.get("code_challenge_method", "plain"),
+        ):
+            return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed."}, status_code=400)
+
+        scopes = data.get("scopes", []) or ["mcp"]
+        installation = data.get("installation") or {}
+        issued = await connector_oauth.issue_token(
+            client_id=client_id,
+            scopes=scopes,
+            installation=installation,
         )
+        return JSONResponse({
+            "access_token": issued["access_token"],
+            "refresh_token": issued["refresh_token"],
+            "token_type": "Bearer",
+            "expires_in": connector_oauth.token_ttl(),
+            "scope": " ".join(scopes),
+        })
 
-    try:
-        messages = _coerce_marketplace_chat_messages(raw_messages)
-    except ValueError as exc:
-        return JSONResponse(
-            {"ok": False, "error": "invalid_request", "message": str(exc)},
-            status_code=400,
+    if grant_type == "refresh_token":
+        refresh_token = body.get("refresh_token", "").strip()
+        if not refresh_token:
+            return JSONResponse({"error": "invalid_request", "error_description": "refresh_token is required."}, status_code=400)
+        record = await connector_oauth.find_refresh_record(refresh_token=refresh_token)
+        if not record or record.get("client_id") != client_id:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Refresh token invalid or expired."}, status_code=400)
+
+        data = record.get("data") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                data = {}
+        scopes = data.get("scopes", []) or ["mcp"]
+        installation = data.get("installation") or {}
+        issued = await connector_oauth.issue_token(
+            client_id=client_id,
+            scopes=scopes,
+            installation=installation,
         )
+        return JSONResponse({
+            "access_token": issued["access_token"],
+            "refresh_token": issued["refresh_token"],
+            "token_type": "Bearer",
+            "expires_in": connector_oauth.token_ttl(),
+            "scope": " ".join(scopes),
+        })
 
-    try:
-        from langchain_openai import ChatOpenAI
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-        from langgraph.prebuilt import create_react_agent
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "llm_dependencies_unavailable", "message": str(exc)},
-            status_code=500,
-        )
-
-    normalized_mcp_url = provided_mcp_url.rstrip("/")
-    mcp_url = normalized_mcp_url if normalized_mcp_url.endswith("/mcp") else f"{normalized_mcp_url}/mcp"
-
-    system_prompt = f"""
-You are the LeadsMCP onboarding assistant embedded inside a GoHighLevel custom page.
-
-Goals:
-- Help the user onboard after installation.
-- Speak in the context of their exact HighLevel location/sub-account.
-- Explain how to connect AI clients like Claude Desktop, Cursor, or ChatGPT-compatible tooling.
-- Recommend the fastest path to value using LeadsMCP tools.
-- Troubleshoot setup and activation issues clearly.
-
-Rules:
-- You are connected to the user's LeadsMCP MCP server.
-- Prefer practical next steps and concise guidance.
-- If the user asks you to perform an action and a tool exists, use it.
-- If you change or create records, briefly summarize what you changed.
-- Keep responses formatted in clear markdown.
-
-Session context:
-- location_id: {location_id or 'unknown'}
-- location_name: {location_name}
-- current_user: {user_name}
-- mcp_server_url: {normalized_mcp_url}
-""".strip()
-
-    try:
-        client = MultiServerMCPClient(
-            {
-                "leadsmcp": {
-                    "url": mcp_url,
-                    "transport": "streamable_http",
-                    "headers": {"X-GHL-Location-ID": location_id} if location_id else {},
-                }
-            }
-        )
-        tools = await client.get_tools()
-        onboarding_tools = [
-            tool for tool in tools
-            if getattr(tool, "name", "").startswith("outscraper_")
-            or getattr(tool, "name", "").startswith("ghl_")
-        ]
-
-        llm_kwargs: dict[str, Any] = {
-            "model": llm_config["model"],
-            "api_key": llm_config["api_key"],
-            "temperature": 1e-8,
-        }
-        if llm_config.get("base_url"):
-            llm_kwargs["base_url"] = llm_config["base_url"]
-
-        llm = ChatOpenAI(**llm_kwargs)
-        agent = create_react_agent(llm, onboarding_tools, prompt=system_prompt)
-        result = await agent.ainvoke({"messages": messages})
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "llm_run_failed", "message": str(exc)},
-            status_code=500,
-        )
-
-    reply = ""
-    tool_calls: list[str] = []
-    for msg in result.get("messages", []):
-        msg_type = getattr(msg, "type", "")
-        if msg_type == "ai":
-            text = _message_content_text(getattr(msg, "content", ""))
-            if text:
-                reply = text
-            for call in getattr(msg, "tool_calls", []) or []:
-                if isinstance(call, dict) and call.get("name"):
-                    tool_calls.append(str(call["name"]))
-
-    if not reply:
-        reply = "I connected to the onboarding workspace, but I did not generate a final answer. Please try rephrasing the request."
-
-    return JSONResponse(
-        {
-            "ok": True,
-            "reply": reply,
-            "toolCalls": sorted(set(tool_calls)),
-            "model": llm_config["model"],
-            "provider": llm_config["provider"],
-            "context": {
-                "locationId": location_id,
-                "locationName": location_name,
-                "userName": user_name,
-                "mcpUrl": normalized_mcp_url,
-            },
-        }
-    )
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
-@orchestrator.custom_route("/api/marketplace/lead-search", methods=["POST"])
-async def marketplace_lead_search(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+# RFC 8414 / RFC 9728 path-suffixed discovery variants. Spec-2025-06-18 MCP
+# clients (Perplexity, Claude, ChatGPT) derive discovery URLs by inserting the
+# resource path ("/mcp") after the well-known prefix, so serve identical
+# metadata for any suffix instead of 401ing.
+@orchestrator.custom_route("/.well-known/oauth-authorization-server/{suffix:path}", methods=["GET"])
+async def connector_oauth_as_metadata_suffixed(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.authorization_server_metadata(_public_base_url(request)))
 
-    encrypted_data = str(body.get("encryptedData") or "").strip()
-    search_type = str(body.get("searchType") or "").strip()
-    raw_params = body.get("params") or {}
 
-    if not encrypted_data:
-        return JSONResponse(
-            {"ok": False, "error": "missing_encrypted_data", "message": "Request JSON must include encryptedData."},
-            status_code=400,
-        )
-    if search_type not in MARKETPLACE_SEARCH_TYPES:
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": "unsupported_search_type",
-                "message": f"Unsupported searchType '{search_type}'.",
-                "supported": sorted(MARKETPLACE_SEARCH_TYPES.keys()),
-            },
-            status_code=400,
-        )
+@orchestrator.custom_route("/.well-known/oauth-protected-resource/{suffix:path}", methods=["GET"])
+async def connector_oauth_pr_metadata_suffixed(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.protected_resource_metadata(_public_base_url(request)))
 
-    try:
-        user_context = _decrypt_marketplace_user_context(encrypted_data)
-        params = _coerce_marketplace_search_params(search_type, raw_params)
-    except ValueError as exc:
-        return JSONResponse(
-            {"ok": False, "error": "invalid_request", "message": str(exc)},
-            status_code=400,
-        )
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "context_decrypt_failed", "message": str(exc)},
-            status_code=400,
-        )
 
-    started = time.perf_counter()
-    try:
-        result = await MARKETPLACE_SEARCH_TYPES[search_type]["handler"](**params)
-    except httpx.HTTPStatusError as exc:
-        status_code = exc.response.status_code if exc.response is not None else 502
-        detail = exc.response.text[:500] if exc.response is not None else str(exc)
-        return JSONResponse(
-            {
-                "ok": False,
-                "error": "outscraper_request_failed",
-                "message": detail,
-                "status_code": status_code,
-            },
-            status_code=502,
-        )
-    except Exception as exc:
-        return JSONResponse(
-            {"ok": False, "error": "search_execution_failed", "message": str(exc)},
-            status_code=502,
-        )
+# Some clients fall back to OpenID Connect discovery; serve the OAuth AS
+# metadata there too (root, path-suffixed, and path-prefixed variants).
+@orchestrator.custom_route("/.well-known/openid-configuration", methods=["GET"])
+@orchestrator.custom_route("/.well-known/openid-configuration/{suffix:path}", methods=["GET"])
+@orchestrator.custom_route("/mcp/.well-known/openid-configuration", methods=["GET"])
+@orchestrator.custom_route("/mcp/.well-known/oauth-authorization-server", methods=["GET"])
+async def connector_oidc_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.authorization_server_metadata(_public_base_url(request)))
 
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    leads = _extract_marketplace_leads(search_type, result)
-    geo_leads = [lead for lead in leads if lead.get("hasCoordinates")]
-    return JSONResponse(
-        {
-            "ok": True,
-            "searchType": search_type,
-            "searchLabel": MARKETPLACE_SEARCH_TYPES[search_type]["label"],
-            "params": params,
-            "elapsedMs": elapsed_ms,
-            "context": _marketplace_user_context_summary(user_context),
-            "leadCount": len(leads),
-            "geoLeadCount": len(geo_leads),
-            "mapCenter": _marketplace_map_center(leads),
-            "leads": leads,
-            "result": result,
-        }
-    )
+
+@orchestrator.custom_route("/mcp/.well-known/oauth-protected-resource", methods=["GET"])
+async def connector_pr_metadata_prefixed(request: Request) -> JSONResponse:
+    return JSONResponse(connector_oauth.protected_resource_metadata(_public_base_url(request)))
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
 @orchestrator.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
+    app_id_configured = bool(os.getenv("GHL_APP_ID", "").strip())
+    success_redirect_configured = bool(
+        os.getenv("GHL_OAUTH_SUCCESS_REDIRECT_URL", "").strip()
+    )
+    marketplace_meter_configured = bool(
+        os.getenv("GHL_MARKETPLACE_METER_ID", "").strip()
+    )
+    durable_oauth_ready = bool(
+        ghl_install_supabase_configured()
+        and connector_oauth._supabase_configured()
+    )
     return JSONResponse({
         "status": "healthy",
-        "services": ["outscraper", "ghl", "stripe"],
+        "services": ["outscraper", "ghl", "stripe", "tempmail"],
         "ghl_mode": "tenant-headers-with-env-fallback",
         "ghl_default_fallback_enabled": bool(DEFAULT_GHL_TOKEN and DEFAULT_GHL_LOCATION),
         "meter_event_name": os.getenv("STRIPE_METER_EVENT_NAME", "qualified_lead_export"),
@@ -3318,9 +2602,36 @@ async def health(request: Request) -> JSONResponse:
             and os.getenv("GHL_OAUTH_REDIRECT_URI", "").strip()
             and os.getenv("GHL_OAUTH_INSTALL_URL", "").strip()
         ),
-        "ghl_oauth_success_redirect_configured": bool(os.getenv("GHL_OAUTH_SUCCESS_REDIRECT_URL", "").strip()),
+        "ghl_oauth_success_redirect_configured": success_redirect_configured,
         "ghl_callback_token_response_enabled": _allow_callback_token_response(),
-        "ghl_install_store_path": str(_install_store_path()),
+        "ghl_app_id_configured": app_id_configured,
+        "ghl_webhook_signature_verification": "ed25519",
+        "ghl_marketplace_meter_configured": marketplace_meter_configured,
+        "leadsmcp_mode": LEADSMCP_MODE,
+        "ghl_install_supabase_configured": ghl_install_supabase_configured(),
+        "ghl_install_store_backend": (
+            install_store_backend()
+            if LEADSMCP_MODE == DEVELOPER_MODE or ghl_install_supabase_configured()
+            else "unavailable"
+        ),
+        "connector_oauth_enabled": connector_oauth.connector_oauth_enabled(),
+        "connector_dcr_enabled": connector_oauth.dcr_enabled(),
+        "connector_oauth_backend": (
+            "supabase"
+            if connector_oauth._supabase_configured()
+            else (
+                "unavailable"
+                if connector_oauth._durable_store_required()
+                else "memory"
+            )
+        ),
+        "production_ready": bool(
+            durable_oauth_ready
+            and app_id_configured
+            and success_redirect_configured
+            and marketplace_meter_configured
+            and not _allow_callback_token_response()
+        ),
         "endpoint": "/mcp",
     })
 

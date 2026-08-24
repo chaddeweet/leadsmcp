@@ -33,7 +33,6 @@ Recommended commercial model:
 ```
 leadsmcp/
 ├── main.py                    ← Orchestrator (deploy this)
-├── agent.py                   ← AI agent that uses the server
 ├── .env.example               ← Environment template (copy to .env)
 ├── servers/
 │   ├── __init__.py
@@ -67,10 +66,6 @@ python main.py
 # 4. Run smoke test (health + list_tools + stripe dry-run)
 python scripts/smoke_test.py --base-url http://localhost:8000
 
-# 5. In a new terminal, run the agent (requires GEMINI_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY in .env)
-python agent.py 1    # Task 1: Plumbers in Johannesburg → GHL
-python agent.py 2    # Task 2: Marketing agencies in Cape Town → GHL + Pipeline
-python agent.py 3    # Task 3: Restaurants in Sandton (read-only, safe test)
 ```
 
 ## Deploy to Railway (Recommended — free tier available)
@@ -114,8 +109,6 @@ railway variables set GHL_AUTO_REFRESH_MANAGED_TOKENS=true
 railway variables set GHL_AUTO_TOKEN_PRIORITY=managed
 railway variables set GHL_AUTO_REFRESH_SKEW_SECONDS=300
 
-railway variables set GEMINI_API_KEY=AIza_your_gemini_key_here
-railway variables set LEADSMCP_MARKETPLACE_LLM_PROVIDER=google
 
 # Stripe usage billing vars
 railway variables set STRIPE_SECRET_KEY=sk_test_or_live_xxx
@@ -204,7 +197,7 @@ Behavior:
 1. If tenant headers are present, `ghl_*` tools use that tenant context.
 2. If `GHL_AUTO_REFRESH_MANAGED_TOKENS=true`, leadsmcp can resolve tenant credentials from install records and auto-refresh expired access tokens using the stored encrypted refresh token.
 3. If no tenant context resolves, server falls back to `GHL_PIT_TOKEN` + `GHL_LOCATION_ID`.
-4. Stripe/outscraper remain shared platform integrations from server env vars.
+4. Stripe stays a shared platform integration from server env vars. Outscraper resolves its key per request from the `x-api-key` header when present, otherwise falls back to the shared `OUTSCRAPER_API_KEY` env var — so tenants may bring their own Outscraper key without sharing yours.
 
 This means other agencies can connect to the same LeadsMCP deployment safely using their own GHL credentials without sharing your default account.
 
@@ -220,7 +213,6 @@ calendars, payments, products, invoices, social planner, blogs, email, forms, an
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GHL_MCP_URL` | `https://services.leadconnectorhq.com/mcp/anthropic/v2` | Override the upstream HighLevel v2 MCP endpoint. |
-| `GHL_API_BASE_URL` | `https://services.leadconnectorhq.com` | REST base used by the deterministic contact tools (`POST /contacts/`). |
 | `GHL_V2_TOOL_ALLOWLIST_ENABLED` | `false` | Enable the legacy lead/contact allowlist compatibility mode. Leave false for full v2 coverage. |
 | `GHL_ENABLED_TOOL_GROUPS` | `contacts,opportunities,conversations,locations` | Groups used only when compatibility mode is enabled. |
 | `GHL_ENABLED_TOOLS` | _(empty)_ | Extra individual tools used only in compatibility mode. |
@@ -231,58 +223,9 @@ current location connection. Use `ghl_describe_operation` before calling
 `ghl_execute_operation`, and request explicit user confirmation before destructive,
 financial, messaging, or other irreversible actions.
 
-### Deterministic contact creation (preferred over `execute_operation`)
-
-For the critical CRM handoff, **prefer the deterministic tools over
-`ghl_execute_operation`**:
-
-- `ghl_contacts_create_contact` → calls the official REST endpoint `POST /contacts/`.
-- `ghl_contacts_upsert_contact` → calls `POST /contacts/upsert` (create-or-update by
-  email/phone; use this when a lead may already exist).
-
-Why prefer them: a fixed, self-documenting schema; the tenant `locationId` is injected
-into the request body automatically (from the `locationId` argument, the
-`x-ghl-location-id` request header, or `GHL_LOCATION_ID`); and upstream `400/401/403/409/
-422` responses are mapped to structured, actionable errors with the token/secret values
-redacted (e.g. a `403` explicitly calls out a missing `contacts.write` scope or a
-location mismatch). They reuse the same per-request tenant credentials as the proxy.
-
-Provide at least one identifier (`email` or `phone`). Supported fields: `firstName`,
-`lastName`, `name`, `companyName`, `email`, `phone`, `address1`, `city`, `state`,
-`postalCode`, `country`, `website`, `timezone`, `tags`, `source`, `customFields`, and
-`additionalFields` (pass-through for any other GHL-accepted key; it cannot override the
-resolved `locationId`).
-
-> **There is no dry-run / preview / validateOnly mode — do not attempt one.** HighLevel's
-> API does not support it and these tools deliberately do not fake it. Sending a
-> `dry_run`/`preview` argument is not part of the schema and will be rejected. Confirm
-> intent with the user *before* the single real call instead of probing with a fake
-> preview. `ghl_execute_operation` remains available for every other operation.
-
-> **No dry-run / preview mode.** `ghl_execute_operation` performs the operation for real;
-> HighLevel's MCP v2 does not expose a dry-run, preview, or `validateOnly` mode, and
-> LeadsMCP does not add one. Do **not** send a `dry_run`/`dryRun`/`preview` argument — it
-> is not part of the schema returned by `ghl_describe_operation` and the upstream server
-> rejects unknown fields, which surfaces as an `execute_operation` failure. Send only the
-> exact fields `ghl_describe_operation` reports, and confirm intent with the user *before*
-> the single real call rather than probing with a fake preview call.
-
-> **create-contact fails or is not active?** Check, in order:
-> 1. The GHL token carries the `contacts.write` scope (see `GHL_OAUTH_SCOPES`). Without it
->    the operation is discoverable/describable but the write is rejected upstream.
-> 2. A tenant token or `GHL_PIT_TOKEN` is present, and a `locationId` is supplied — via the
->    `x-ghl-location-id` request header, the `GHL_LOCATION_ID` default, or in the operation
->    params. Writes are location-scoped even though reads may not appear to be.
-> 3. The payload matches `ghl_describe_operation` exactly (no extra wrapper key, no
->    `dry_run` flag). LeadsMCP forwards arguments to the upstream tool unchanged — it does
->    not wrap or rename them.
-
-> **Compatibility mode + the v2 catalog.** When `GHL_V2_TOOL_ALLOWLIST_ENABLED=true`, the
-> legacy group filter still keeps the five v2 catalog tools (`ghl_search`, `ghl_fetch`,
-> `ghl_search_operations`, `ghl_describe_operation`, `ghl_execute_operation`) available —
-> they gate access at the operation level upstream, so they are never hidden by the
-> group/`GHL_ENABLED_TOOL_GROUPS` list. Only per-domain legacy tool names (e.g.
-> `ghl_blogs_create-post`) are subject to group filtering.
+> **create-contact not active?** It requires a GHL token with the `contacts.write`
+> scope. Confirm the scope is granted (see `GHL_OAUTH_SCOPES`) and that a tenant token
+> or `GHL_PIT_TOKEN` is present; the tool is otherwise not returned by the GHL endpoint.
 
 ### Durable Install Storage
 
@@ -368,40 +311,6 @@ This repo is now compatible with that model because GHL credentials are request-
 - `GET /api/cron/ghl-refresh-installs`:
   - Daily Vercel Cron target.
   - Uses `Authorization: Bearer <CRON_SECRET>`.
-
-### GHL Custom Marketplace Page
-
-Leadsmcp now includes a custom-page-ready search workspace for HighLevel Marketplace apps:
-
-- Page URL: `GET /app/lead-search`
-- Context endpoint: `POST /api/marketplace/user-context`
-- Search endpoint: `POST /api/marketplace/lead-search`
-
-What it does:
-
-1. Loads inside a HighLevel custom page iframe.
-2. Requests encrypted user context from the parent window using `REQUEST_USER_DATA`.
-3. Decrypts that payload server-side with `GHL_APP_SHARED_SECRET`.
-4. Shows the connected company/location/user context inside the page.
-5. Lets the user choose a supported search mode and fill the required parameters.
-6. Runs the search server-side against the existing Outscraper integration and returns the raw payload.
-
-Current supported search types:
-
-- `google_maps_search`
-- `emails_and_contacts`
-- `google_search`
-
-Required env:
-
-- `GHL_APP_SHARED_SECRET=<your marketplace app shared secret>`
-
-Without that secret, the custom page can render but it cannot decrypt user context from HighLevel.
-
-### Use with deployed agent
-```bash
-MCP_SERVER_URL=https://your-app.railway.app/mcp python agent.py 1
-```
 
 ## Stripe Usage-Based Billing Flow
 

@@ -25,14 +25,11 @@ At minimum set:
 - `GHL_OAUTH_REDIRECT_URI`
 - `GHL_OAUTH_SUCCESS_REDIRECT_URL`
 - `GHL_OAUTH_INSTALL_URL`
-- `GHL_APP_SHARED_SECRET` if using GHL custom pages
-- `MAPBOX_PUBLIC_TOKEN` if using the map UI
 - `CRON_SECRET`
 
 Optional:
 - `STRIPE_SECRET_KEY`
 - `STRIPE_METERED_PRICE_ID`
-- `OPENAI_API_KEY`
 
 ### 3. Deploy
 Vercel will use the repo configuration already included in `vercel.json`.
@@ -44,7 +41,6 @@ Check:
 - `/mcp`
 - `/leadsmcp-install/`
 - `/app-install-successfully/`
-- `/app/lead-search/`
 
 ### 5. Verify durable install storage
 `/health` should show:

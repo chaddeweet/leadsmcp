@@ -1,0 +1,32 @@
+# Local environments and caches
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+leadsmcp-build-cache/
+
+# Version-control and local Vercel metadata
+.git/
+.github/
+.vercel/
+.DS_Store
+
+# Development / backup files
+*.pyc
+*.pyo
+*.bak
+*.codexbak
+*.log
+
+# Non-runtime directories
+android-app/
+distribution/
+releases/
+exported-assets/
+tests/
+
+# Local environment secrets — Vercel Production env vars are used instead
+.env
+.env.*
+!.env.example

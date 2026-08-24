@@ -19,6 +19,8 @@ from typing import Any
 import httpx
 from fastmcp import FastMCP
 
+from servers.http_retry import request_with_retries
+
 mcp = FastMCP(name="Stripe Billing")
 
 STRIPE_API_BASE = "https://api.stripe.com/v1"
@@ -161,6 +163,20 @@ def _stripe_error_message(payload: Any, fallback: str) -> str:
     return fallback
 
 
+def _stripe_retry_allowed(method: str, idempotency_key: str | None) -> bool:
+    """Decide whether a Stripe call is safe to retry after a transient failure.
+
+    - GET/HEAD are read-only and always safe to repeat.
+    - Writes (POST/DELETE) are only safe to retry when they carry an
+      Idempotency-Key, which lets Stripe dedupe the repeat server-side. Retrying
+      a keyless write could double-charge or create duplicate resources, so we
+      refuse to retry those.
+    """
+    if method.upper() in {"GET", "HEAD"}:
+        return True
+    return bool(idempotency_key and idempotency_key.strip())
+
+
 async def _stripe_request(
     method: str,
     path: str,
@@ -170,15 +186,24 @@ async def _stripe_request(
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     secret = _required_env("STRIPE_SECRET_KEY")
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        response = await client.request(
-            method=method,
-            url=f"{STRIPE_API_BASE}{path}",
-            auth=(secret, ""),
-            data=data,
-            params=params,
-            headers=_stripe_headers(idempotency_key=idempotency_key),
-        )
+    retryable = _stripe_retry_allowed(method, idempotency_key)
+
+    async def _send() -> httpx.Response:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            return await client.request(
+                method=method,
+                url=f"{STRIPE_API_BASE}{path}",
+                auth=(secret, ""),
+                data=data,
+                params=params,
+                headers=_stripe_headers(idempotency_key=idempotency_key),
+            )
+
+    response = await request_with_retries(
+        _send,
+        max_retries=4 if retryable else 0,
+        retry_network_errors=retryable,
+    )
 
     try:
         payload = response.json()
