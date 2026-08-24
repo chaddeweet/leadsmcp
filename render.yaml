@@ -34,8 +34,6 @@ services:
         sync: false
       - key: GHL_OAUTH_SUCCESS_REDIRECT_URL
         sync: false
-      - key: OPENAI_API_KEY
-        sync: false
       - key: MCP_SECRET
         sync: false
       - key: CORS_ALLOWED_ORIGINS
