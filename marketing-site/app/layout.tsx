@@ -1,0 +1,4 @@
+import type { Metadata } from 'next';
+import './globals.css';
+export const metadata: Metadata = { metadataBase: new URL('https://leads.chaddewet.com'), title: 'Leads | Find, Enrich and Activate Qualified Leads', description: 'Discover businesses, enrich lead data, qualify prospects, and send sales-ready leads into your CRM or automation workflow.', alternates: { canonical: '/' }, openGraph: { title: 'Leads | Find, Enrich and Activate Qualified Leads', description: 'Discover businesses, enrich lead data, qualify prospects, and send sales-ready leads into your CRM or automation workflow.', url: 'https://leads.chaddewet.com', siteName: 'Leads', type: 'website' } };
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) { return <html lang="en"><body>{children}</body></html>; }
