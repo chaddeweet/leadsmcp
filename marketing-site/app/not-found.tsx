@@ -1,0 +1,2 @@
+import Link from 'next/link';
+export default function NotFound(){return <main style={{minHeight:'100vh',display:'grid',placeItems:'center',padding:'2rem',textAlign:'center'}}><div><p style={{color:'#80b9ff'}}>404</p><h1 style={{fontSize:'clamp(2.5rem,7vw,5rem)'}}>This lead is not here.</h1><p style={{color:'#93a4ba'}}>The page you requested could not be found.</p><Link href="/" style={{color:'#7cc7ff',fontWeight:700}}>Return to Leads →</Link></div></main>}

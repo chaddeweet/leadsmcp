@@ -1,0 +1,2 @@
+import Link from 'next/link';
+export default function AppEntry(){return <main style={{minHeight:'100vh',display:'grid',placeItems:'center',padding:'2rem',textAlign:'center'}}><div><p style={{color:'#80b9ff'}}>LEADS</p><h1>Product access is coming together.</h1><p style={{color:'#93a4ba',maxWidth:520}}>This is a clearly marked product-entry placeholder. It does not collect data or simulate authentication.</p><Link href="/" style={{color:'#7cc7ff',fontWeight:700}}>Return to site →</Link></div></main>}

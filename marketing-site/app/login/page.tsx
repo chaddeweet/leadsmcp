@@ -1,0 +1,2 @@
+import Link from 'next/link';
+export default function Login(){return <main style={{minHeight:'100vh',display:'grid',placeItems:'center',padding:'2rem',textAlign:'center'}}><div><p style={{color:'#80b9ff'}}>LEADS</p><h1>Sign-in access is being prepared.</h1><p style={{color:'#93a4ba',maxWidth:520}}>Authentication is not enabled in this marketing-site preview. Product access will be available through the configured Leads account flow.</p><Link href="/" style={{color:'#7cc7ff',fontWeight:700}}>Return to site →</Link></div></main>}
